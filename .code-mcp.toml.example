@@ -1,0 +1,26 @@
+# 复制到仓库根目录并改名为 .code-mcp.toml 即可生效。
+# 没有这个文件时，gate 步骤会按 marker 文件自动探测。
+
+[project]
+# 在默认排除列表之外，额外跳过的目录名
+exclude = ["sample_data", "vendor", "generated"]
+
+# 只索引这些语言；留空表示全部
+languages = ["python", "typescript", "rust"]
+
+[gate]
+# 按顺序执行。某一步失败不会阻断后续步骤，但整体判定为失败。
+[[gate.steps]]
+name = "tests"
+command = "python run_tests.py"
+timeout = 900
+
+[[gate.steps]]
+name = "lint"
+command = "ruff check ."
+timeout = 120
+
+[[gate.steps]]
+name = "types"
+command = "mypy src"
+timeout = 300

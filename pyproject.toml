@@ -1,0 +1,29 @@
+[project]
+name = "code-mcp"
+version = "0.1.0"
+description = "Local code-context MCP server: precise symbol slicing, causal dependency packing, health review and surgical edits for AI coding agents"
+readme = "README.md"
+authors = [
+    { name = "qxkt222" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=2.3.0",
+    "tree-sitter>=0.25.2",
+    "tree-sitter-python>=0.25.0",
+    "tree-sitter-rust>=0.24.0",
+    "tree-sitter-typescript>=0.23.2",
+]
+
+[project.scripts]
+code-mcp = "code_mcp.cli:main"
+code-mcp-server = "code_mcp.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
