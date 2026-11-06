@@ -26,7 +26,7 @@ from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
 from .review.structural import analyze as analyze_structure
-from .serialize import pack_dict
+from .serialize import pack_dict, with_response_tokens
 from .types import Symbol
 
 INSTRUCTIONS = (
@@ -92,15 +92,17 @@ def index(path: str, force: bool = False) -> dict:
             "(SELECT COUNT(*) FROM symbols) AS symbols, "
             "(SELECT COUNT(*) FROM refs) AS refs"
         ).fetchone()
-        return {
-            "indexed": stats.files_indexed,
-            "skipped": stats.files_skipped,
-            "removed": stats.files_removed,
-            "symbols": totals["symbols"],
-            "refs": totals["refs"],
-            "files_total": totals["files"],
-            "duration_s": round(stats.duration_s, 2),
-        }
+        return with_response_tokens(
+            {
+                "indexed": stats.files_indexed,
+                "skipped": stats.files_skipped,
+                "removed": stats.files_removed,
+                "symbols": totals["symbols"],
+                "refs": totals["refs"],
+                "files_total": totals["files"],
+                "duration_s": round(stats.duration_s, 2),
+            }
+        )
     finally:
         conn.close()
 
@@ -123,12 +125,15 @@ def find(path: str, query: str, kinds: list[str] | None = None, limit: int = 20)
     try:
         symbols = search_symbols(conn, query, kinds=kinds, limit=limit)
         comments = search_comments(conn, query, limit=max(1, limit // 2))
-        return {
-            "symbols": [_symbol_dict(symbol) for symbol in symbols],
-            "comments": [
-                {"file": file, "line": line, "text": text} for file, line, text in comments
-            ],
-        }
+        return with_response_tokens(
+            {
+                "symbols": [_symbol_dict(symbol) for symbol in symbols],
+                "comments": [
+                    {"file": file, "line": line, "text": text}
+                    for file, line, text in comments
+                ],
+            }
+        )
     finally:
         conn.close()
 
@@ -142,6 +147,7 @@ def pack(
     segment: int | None = None,
     max_target_tokens: int = 4000,
     force: bool = False,
+    target_only: bool = False,
 ) -> dict:
     """Return the target symbol plus its causal neighbourhood, trimmed to a budget.
 
@@ -167,6 +173,8 @@ def pack(
             default 4000.
         force: return the packed context even when it costs more than reading the
             file
+        target_only: return just the target (or its outline); omit callers,
+            callees, imports and tests
     """
     root = _root(path)
     conn = _conn(root)
@@ -181,8 +189,9 @@ def pack(
             max_target_tokens=max_target_tokens,
             segment=segment,
             force=force,
+            target_only=target_only,
         )
-        return pack_dict(result)
+        return with_response_tokens(pack_dict(result))
     finally:
         conn.close()
 
@@ -235,14 +244,16 @@ def slice_symbol(
             raise ValueError("provide either name or start_line")
 
         text = "\n".join(lines[first - 1 : last])
-        return {
-            "file": file,
-            "symbol": label,
-            "start_line": first,
-            "end_line": last,
-            "tokens": token_util.estimate(text),
-            "text": text,
-        }
+        return with_response_tokens(
+            {
+                "file": file,
+                "symbol": label,
+                "start_line": first,
+                "end_line": last,
+                "tokens": token_util.estimate(text),
+                "text": text,
+            }
+        )
     finally:
         conn.close()
 
@@ -272,16 +283,18 @@ def edit(
     try:
         result = replace_symbol(root, file, name, new_code, expect_hash=expect_hash)
         conn.commit()
-        return {
-            "file": result.file,
-            "symbol": result.symbol,
-            "applied": result.applied,
-            "reason": result.reason,
-            "lines_added": result.lines_added,
-            "lines_removed": result.lines_removed,
-            "new_hash": result.new_hash,
-            "diff": result.diff,
-        }
+        return with_response_tokens(
+            {
+                "file": result.file,
+                "symbol": result.symbol,
+                "applied": result.applied,
+                "reason": result.reason,
+                "lines_added": result.lines_added,
+                "lines_removed": result.lines_removed,
+                "new_hash": result.new_hash,
+                "diff": result.diff,
+            }
+        )
     finally:
         conn.close()
 
@@ -324,20 +337,22 @@ def impact(
             include_tests=include_tests,
             include_imports=include_imports,
         )
-        return {
-            "target": _symbol_dict(symbol),
-            "affected": [
-                {
-                    **_symbol_dict(node.symbol),
-                    "depth": node.depth,
-                    "via": node.via,
-                    "line": node.line,
-                }
-                for node in nodes
-            ],
-            "count": len(nodes),
-            "filtered": nodes.filtered,
-        }
+        return with_response_tokens(
+            {
+                "target": _symbol_dict(symbol),
+                "affected": [
+                    {
+                        **_symbol_dict(node.symbol),
+                        "depth": node.depth,
+                        "via": node.via,
+                        "line": node.line,
+                    }
+                    for node in nodes
+                ],
+                "count": len(nodes),
+                "filtered": nodes.filtered,
+            }
+        )
     finally:
         conn.close()
 
@@ -373,22 +388,24 @@ def review(path: str, min_severity: str = "P2", paths: list[str] | None = None) 
         for item in kept:
             counts[item.severity] += 1
 
-        return {
-            "counts": counts,
-            "findings": [
-                {
-                    "rule": item.rule,
-                    "severity": item.severity,
-                    "file": item.file,
-                    "line": item.line,
-                    "symbol": item.symbol,
-                    "message": item.message,
-                }
-                for item in kept
-            ],
-            "external_ran": ran,
-            "external_missing": missing,
-        }
+        return with_response_tokens(
+            {
+                "counts": counts,
+                "findings": [
+                    {
+                        "rule": item.rule,
+                        "severity": item.severity,
+                        "file": item.file,
+                        "line": item.line,
+                        "symbol": item.symbol,
+                        "message": item.message,
+                    }
+                    for item in kept
+                ],
+                "external_ran": ran,
+                "external_missing": missing,
+            }
+        )
     finally:
         conn.close()
 
@@ -411,21 +428,23 @@ def gate(path: str, only: list[str] | None = None, timeout_s: int = 600) -> dict
             step.timeout = min(step.timeout, timeout_s)
 
     result = run_gate(config, only=only)
-    return {
-        "passed": result.passed,
-        "detected_config": config.detected,
-        "steps": [
-            {
-                "name": step.name,
-                "command": step.command,
-                "passed": step.passed,
-                "exit_code": step.exit_code,
-                "duration_s": round(step.duration_s, 2),
-                "output": step.output,
-            }
-            for step in result.steps
-        ],
-    }
+    return with_response_tokens(
+        {
+            "passed": result.passed,
+            "detected_config": config.detected,
+            "steps": [
+                {
+                    "name": step.name,
+                    "command": step.command,
+                    "passed": step.passed,
+                    "exit_code": step.exit_code,
+                    "duration_s": round(step.duration_s, 2),
+                    "output": step.output,
+                }
+                for step in result.steps
+            ],
+        }
+    )
 
 
 def _register() -> None:

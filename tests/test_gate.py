@@ -6,13 +6,26 @@ import sys
 from pathlib import Path
 
 from code_mcp.config import Config, GateStepSpec
-from code_mcp.review.gate import MAX_OUTPUT_CHARS, _truncate, run_gate
+from code_mcp.review.gate import (
+    MAX_OUTPUT_CHARS,
+    SUCCESS_OUTPUT_LINES,
+    _tail_lines,
+    _truncate,
+    output_truncated,
+    run_gate,
+)
 from code_mcp.serialize import gate_dict
 from code_mcp.types import GateResult, GateStep
 
 
 def _python(expression: str) -> str:
     return f'"{sys.executable}" -c "{expression}"'
+
+
+def _script(tmp_path: Path, source: str) -> str:
+    path = tmp_path / "gate_script.py"
+    path.write_text(source, encoding="utf-8")
+    return f'"{sys.executable}" "{path}"'
 
 
 def _config(root: Path, steps: list[GateStepSpec]) -> Config:
@@ -70,21 +83,20 @@ def test_only_filter(tmp_path: Path) -> None:
     assert result.passed is True
 
 
-def test_output_is_truncated_keeping_both_ends(tmp_path: Path) -> None:
-    config = _config(
-        tmp_path,
-        [GateStepSpec("noisy", _python("print('HEAD' + 'x' * 20000 + 'TAIL')"))],
-    )
+def test_failed_output_is_truncated_keeping_both_ends(tmp_path: Path) -> None:
+    command = _python("print('HEAD' + 'x' * 20000 + 'TAIL'); raise SystemExit(1)")
+    config = _config(tmp_path, [GateStepSpec("noisy", command)])
 
     result = run_gate(config)
 
     output = result.steps[0].output
-    assert result.steps[0].passed is True
+    assert result.steps[0].passed is False
     assert len(output) == MAX_OUTPUT_CHARS
     # The failure summary lives at the end, so the tail must survive.
     assert output.startswith("HEAD")
     assert output.rstrip().endswith("TAIL")
     assert "...[truncated]..." in output
+    assert output_truncated(result.steps[0]) is True
 
 
 def test_truncate_uses_one_third_head_and_rest_tail() -> None:
@@ -103,6 +115,71 @@ def test_short_output_is_untouched() -> None:
     assert _truncate("small", limit=300) == "small"
 
 
+def test_tail_lines_keeps_only_the_last_ten() -> None:
+    text = "\n".join(f"line{i}" for i in range(1, 21))
+
+    rendered, truncated = _tail_lines(text)
+
+    assert truncated is True
+    assert rendered == "\n".join(f"line{i}" for i in range(11, 21))
+
+
+def test_tail_lines_leaves_short_output_alone() -> None:
+    text = "\n".join(f"line{i}" for i in range(1, SUCCESS_OUTPUT_LINES + 1))
+
+    assert _tail_lines(text) == (text, False)
+
+
+def test_tail_lines_normalises_crlf() -> None:
+    text = "\r\n".join(f"line{i}" for i in range(1, 21)) + "\r\n"
+
+    rendered, truncated = _tail_lines(text)
+
+    assert truncated is True
+    assert "\r" not in rendered
+    assert rendered == "\n".join(f"line{i}" for i in range(11, 21))
+
+
+def test_passing_step_keeps_only_the_last_ten_lines(tmp_path: Path) -> None:
+    command = _script(tmp_path, "for i in range(1, 21):\n    print(f'line{i}')\n")
+    config = _config(tmp_path, [GateStepSpec("chatty", command)])
+
+    result = run_gate(config)
+
+    step = result.steps[0]
+    assert step.passed is True
+    assert step.output.splitlines() == [f"line{i}" for i in range(11, 21)]
+    assert output_truncated(step) is True
+
+
+def test_passing_step_with_short_output_is_untouched(tmp_path: Path) -> None:
+    command = _script(tmp_path, "print('one')\nprint('two')\n")
+    config = _config(tmp_path, [GateStepSpec("quiet", command)])
+
+    result = run_gate(config)
+
+    step = result.steps[0]
+    assert step.passed is True
+    assert step.output.splitlines() == ["one", "two"]
+    assert output_truncated(step) is False
+
+
+def test_failed_step_short_output_is_untouched(tmp_path: Path) -> None:
+    command = _python("print('boom'); raise SystemExit(2)")
+    config = _config(tmp_path, [GateStepSpec("short-fail", command)])
+
+    result = run_gate(config)
+
+    step = result.steps[0]
+    assert step.passed is False
+    assert step.output.splitlines() == ["boom"]
+    assert output_truncated(step) is False
+
+
+def test_output_truncated_defaults_to_false_for_plain_steps() -> None:
+    assert output_truncated(GateStep(name="plain", command="true", exit_code=0)) is False
+
+
 def test_gate_dict_matches_the_mcp_shape() -> None:
     result = GateResult(
         steps=[
@@ -119,19 +196,25 @@ def test_gate_dict_matches_the_mcp_shape() -> None:
 
     payload = gate_dict(result, detected_config=True)
 
-    assert payload == {
+    assert payload["passed"] is False
+    assert payload["detected_config"] is True
+    (step,) = payload["steps"]
+    # ``output_truncated`` is owned by serialize.gate_dict; accept it when
+    # present, but the six stable keys must not change.
+    assert {key: step[key] for key in (
+        "name",
+        "command",
+        "passed",
+        "exit_code",
+        "duration_s",
+        "output",
+    )} == {
+        "name": "tests",
+        "command": "python -m pytest -q",
         "passed": False,
-        "detected_config": True,
-        "steps": [
-            {
-                "name": "tests",
-                "command": "python -m pytest -q",
-                "passed": False,
-                "exit_code": 1,
-                "duration_s": 1.23,
-                "output": "boom",
-            }
-        ],
+        "exit_code": 1,
+        "duration_s": 1.23,
+        "output": "boom",
     }
 
 

@@ -20,7 +20,7 @@ from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
 from .review.structural import analyze as analyze_structure
-from .serialize import pack_dict
+from .serialize import pack_dict, with_response_tokens
 from .edit import replace_symbol
 from . import tokens as token_util
 
@@ -30,8 +30,9 @@ def _open(path: str):
     return root, open_index(root)
 
 
-def _print_json(payload: object) -> None:
-    json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+def _print_json(payload: dict) -> None:
+    """Emit one JSON response; every command reports its own token cost."""
+    json.dump(with_response_tokens(payload), sys.stdout, ensure_ascii=False, indent=2)
     sys.stdout.write("\n")
 
 
@@ -122,6 +123,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
             max_target_tokens=args.max_target_tokens,
             segment=args.segment,
             force=args.force,
+            target_only=args.target_only,
         )
         if args.json:
             _print_json(pack_dict(result))
@@ -394,6 +396,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="return the pack even when it costs more than reading the file",
+    )
+    pack_parser.add_argument(
+        "--target-only",
+        action="store_true",
+        dest="target_only",
+        help="return just the target; omit callers, callees, imports and tests",
     )
     pack_parser.set_defaults(func=cmd_pack)
 

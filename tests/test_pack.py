@@ -1144,3 +1144,227 @@ def test_cli_gate_json_matches_the_server_shape():
             "output": "ok",
         }
     ]
+
+
+# --------------------------------------------------------------------------- #
+# B: response_tokens on every JSON response
+# --------------------------------------------------------------------------- #
+
+
+def test_with_response_tokens_measures_the_payload_without_itself():
+    from code_mcp.serialize import with_response_tokens
+
+    payload = {"symbols": [{"file": "a.py", "qualname": "alpha"}], "comments": []}
+    sized = with_response_tokens(payload)
+
+    assert sized is payload
+    assert sized["response_tokens"] == tokens.estimate(
+        json.dumps(
+            {key: value for key, value in sized.items() if key != "response_tokens"},
+            ensure_ascii=False,
+        )
+    )
+
+
+def test_with_response_tokens_keeps_pack_existing_cost(tmp_path):
+    from code_mcp.serialize import with_response_tokens
+
+    conn, _ids = _fixture(tmp_path)
+    packed = pack(conn, tmp_path, "app/service.py", "load", budget_tokens=10**6)
+    data = with_response_tokens(pack_dict(packed))
+
+    assert data["response_tokens"] == packed.response_tokens
+
+
+def test_cli_json_output_reports_response_tokens(capsys):
+    from code_mcp import cli
+
+    cli._print_json({"symbols": [], "comments": []})
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["response_tokens"] > 0
+    assert payload["response_tokens"] == tokens.estimate(
+        json.dumps({"symbols": [], "comments": []}, ensure_ascii=False)
+    )
+
+
+def test_server_find_reports_response_tokens(tmp_path, monkeypatch):
+    from code_mcp import server
+
+    conn, _ids = _fixture(tmp_path)
+    monkeypatch.setattr(server, "_conn", lambda root: conn)
+
+    payload = server.find(str(tmp_path), "load")
+
+    assert payload["symbols"]
+    assert payload["response_tokens"] > 0
+
+
+# --------------------------------------------------------------------------- #
+# Target-only packs
+# --------------------------------------------------------------------------- #
+
+
+def test_pack_target_only_returns_the_target_and_no_neighbours(tmp_path):
+    conn, _ids = _fixture(tmp_path)
+
+    packed = pack(
+        conn,
+        tmp_path,
+        "app/service.py",
+        "load",
+        budget_tokens=10**6,
+        target_only=True,
+    )
+
+    assert packed.target is not None
+    assert "def load(path):" in packed.target.text
+    assert packed.callers == []
+    assert packed.callees == []
+    assert packed.imports == []
+    assert packed.tests == []
+    assert "target only: neighbour sections omitted" in packed.note
+    assert "use include_* to fetch them" in packed.note
+
+
+def test_pack_target_only_still_segments_an_oversized_target(tmp_path):
+    conn, _source, _callers = _big_fixture(tmp_path)
+
+    packed = pack(conn, tmp_path, "big.py", "big", target_only=True)
+
+    assert packed.target is not None
+    assert packed.target.truncated is True
+    assert len(packed.target.segments) >= 2
+    assert packed.callers == []
+    assert packed.callees == []
+    assert packed.token_baseline > 0
+    assert packed.response_tokens > 0
+    assert packed.savings_pct == tokens.savings_pct(
+        packed.token_total, packed.token_baseline
+    )
+    assert packed.worth_using is True
+    assert "target only: neighbour sections omitted" in packed.note
+
+
+def test_force_degrades_to_the_target_when_the_envelope_loses(tmp_path, monkeypatch):
+    conn, _ids = _fixture(tmp_path)
+    # Force the envelope to dominate so the full pack cannot beat a plain read.
+    monkeypatch.setattr(tokens, "envelope_tokens", lambda slices: 10**6)
+
+    packed = pack(
+        conn,
+        tmp_path,
+        "app/service.py",
+        "load",
+        budget_tokens=10**6,
+        force=True,
+    )
+
+    assert packed.target is not None
+    assert "def load(path):" in packed.target.text
+    assert packed.callers == []
+    assert packed.callees == []
+    assert packed.imports == []
+    assert packed.tests == []
+    assert packed.note.startswith("forced: ")
+    assert "target only: neighbour sections omitted" in packed.note
+    assert "full pack cost" in packed.note
+
+
+def test_server_pack_exposes_target_only(tmp_path, monkeypatch):
+    from code_mcp import server
+
+    conn, _ids = _fixture(tmp_path)
+    monkeypatch.setattr(server, "_conn", lambda root: conn)
+
+    payload = server.pack(
+        str(tmp_path), "app/service.py", "load", target_only=True
+    )
+
+    assert payload["target"] is not None
+    assert payload["callers"] == []
+    assert payload["callees"] == []
+    assert payload["imports"] == []
+    assert payload["tests"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Module import anchors
+# --------------------------------------------------------------------------- #
+
+_ANCHOR_MONEY = '''def money(value):
+    return value
+'''
+
+_ANCHOR_MODELS = '''"""Domain models."""
+
+from .money import money
+
+
+class Customer:
+    """A customer."""
+
+    def label(self) -> str:
+        return money(self.name)
+'''
+
+_ANCHOR_ORDERS = '''"""Orders."""
+
+from .models import Customer
+
+
+def place(customer: Customer) -> str:
+    """Place an order for ``customer``."""
+    return customer.label()
+''' + "\n".join(f"# padding line {index}" for index in range(1, 301)) + "\n"
+
+
+def test_module_import_anchors_render_import_rows_not_end_of_file(tmp_path):
+    (tmp_path / "shop").mkdir()
+    (tmp_path / "shop" / "money.py").write_text(
+        _ANCHOR_MONEY, encoding="utf-8", newline="\n"
+    )
+    (tmp_path / "shop" / "models.py").write_text(
+        _ANCHOR_MODELS, encoding="utf-8", newline="\n"
+    )
+    conn, _target = _built_index(tmp_path, "shop/orders.py", _ANCHOR_ORDERS)
+
+    packed = pack(conn, tmp_path, "shop/orders.py", "place")
+
+    assert packed.imports, "the import section must not be empty"
+    texts = [item.text for item in packed.imports]
+    assert "from .models import Customer" in texts
+    for item in packed.imports:
+        assert item.kind == "module"
+        # A summary carries no source range; it must never be sliced from the
+        # file tail like the old zero-width anchor.
+        assert (item.start_line, item.end_line) == (0, 0)
+        assert item.text.strip() not in {"}", "    )"}
+        assert item.text.startswith(("from ", "module: "))
+
+
+def test_cli_pack_flag_wires_target_only(tmp_path, monkeypatch, capsys):
+    from code_mcp import cli
+
+    conn, _ids = _fixture(tmp_path)
+    monkeypatch.setattr(cli, "_open", lambda path: (tmp_path, conn))
+
+    code = cli.main(
+        [
+            "pack",
+            "app/service.py",
+            "load",
+            "--json",
+            "--target-only",
+            "-b",
+            "1000000",
+        ]
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["target"]["text"].startswith("def load(path):")
+    assert payload["callers"] == []
+    assert payload["callees"] == []
+    assert payload["imports"] == []
+    assert payload["tests"] == []

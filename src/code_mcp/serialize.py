@@ -7,8 +7,25 @@ produced: the caller can hand the result straight to ``json.dump``.
 
 from __future__ import annotations
 
+import json
+
 from . import tokens
 from .types import GateResult, Pack, Segment, Slice
+
+
+def with_response_tokens(payload: dict) -> dict:
+    """Attach the serialised cost of this payload to itself.
+
+    The estimate is taken before the field is written, so the reported number
+    covers the whole response except the ``response_tokens`` key itself. A
+    payload that already reports its own envelope cost (``pack``) keeps that
+    value: this helper only fills in the commands that had no cost field.
+    """
+    if "response_tokens" not in payload:
+        payload["response_tokens"] = tokens.estimate(
+            json.dumps(payload, ensure_ascii=False)
+        )
+    return payload
 
 
 def segment_dict(segment: Segment) -> dict:

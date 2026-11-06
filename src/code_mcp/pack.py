@@ -302,6 +302,78 @@ def _to_slice(piece: _Piece) -> Slice:
     )
 
 
+def _outline_piece(
+    target: Symbol,
+    reader: _Reader,
+    lang: str,
+    budget: int,
+    max_target_tokens: int,
+) -> tuple[_Piece, int]:
+    """Target body, or a signature plus outline when it is oversized.
+
+    The second value is the number of segments in an outline, or 0 when the
+    body was small enough to return whole.
+    """
+    piece = _full_piece(target, reader)
+    threshold = min(max_target_tokens, budget) if budget > 0 else max_target_tokens
+    if piece.tokens <= threshold:
+        return piece, 0
+    segments = _segment_target(target, reader, lang)
+    if not segments:
+        return piece, 0
+    outline = _signature_piece(target, reader)
+    outline.segments = segments
+    outline.truncated = True
+    outline.total_tokens = piece.tokens
+    return outline, len(segments)
+
+
+def _target_only_pack(
+    target: Symbol,
+    reader: _Reader,
+    lang: str,
+    baseline: int,
+    budget: int,
+    max_target_tokens: int,
+    force: bool,
+    reason: str = "",
+) -> Pack:
+    """Return the target alone; neighbour sections are never read."""
+    piece, split_segments = _outline_piece(
+        target, reader, lang, budget, max_target_tokens
+    )
+    target_slice = _to_slice(piece)
+    token_total = target_slice.tokens
+    response_tokens = token_total + tokens.envelope_tokens(
+        [(target_slice.file, target_slice.symbol)]
+    )
+    worth = tokens.worth_using(response_tokens, baseline)
+    note = _build_note(
+        token_total,
+        baseline,
+        budget,
+        {},
+        0,
+        worth,
+        split_segments,
+        response_tokens=response_tokens,
+    )
+    note += "; target only: neighbour sections omitted; use include_* to fetch them"
+    if reason:
+        note += f"; {reason}"
+    if force:
+        note = f"forced: {note}"
+    return Pack(
+        target=target_slice,
+        token_total=token_total,
+        response_tokens=response_tokens,
+        token_baseline=baseline,
+        savings_pct=tokens.savings_pct(token_total, baseline),
+        worth_using=worth,
+        note=note,
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Target and neighbours
 # --------------------------------------------------------------------------- #
@@ -432,6 +504,42 @@ def _import_symbol(
     return None
 
 
+def _import_summary(module: str, alias: str) -> str:
+    """One-line import statement for an import row.
+
+    ``imports`` rows store ``(module, imported name)``, so the two common forms
+    can be rebuilt without reading source.
+    """
+    module = (module or "").strip().strip("'\"")
+    alias = (alias or "").strip().strip("'\"")
+    if module and alias:
+        return f"from {module} import {alias}"
+    if module:
+        return f"module: {module}"
+    if alias:
+        return f"module: {alias}"
+    return ""
+
+
+def _summary_piece(rel: str, label: str, text: str) -> _Piece:
+    """Synthetic one-line import summary.
+
+    ``start_line``/``end_line`` are 0: the text is not a source range, unlike a
+    real slice. ``full`` is set so a summary is never expanded.
+    """
+    return _Piece(
+        symbol=None,
+        file=rel,
+        start_line=0,
+        end_line=0,
+        kind="module",
+        label=label,
+        full=True,
+        text=text,
+        tokens=tokens.estimate(text),
+    )
+
+
 def _import_pieces(
     conn: sqlite3.Connection,
     rel: str,
@@ -457,6 +565,11 @@ def _import_pieces(
 
     pieces: list[_Piece] = []
     seen_files: set[int] = set()
+    # Module anchors carry no source range, so their import rows are collected
+    # per module and rendered as one ``from X import a, b`` summary line.
+    summaries: dict[str, _Piece] = {}
+    summary_aliases: dict[str, list[str]] = {}
+    seen_rows: set[tuple[str, str]] = set()
     for imp in import_rows:
         resolved = imp["resolved_file_id"]
         target_path = by_id.get(int(resolved)) if resolved is not None else None
@@ -467,7 +580,28 @@ def _import_pieces(
 
         file_id, _lang = files[target_path]
         symbol = _import_symbol(conn, file_id, imp["module"], imp["alias"])
-        if symbol is not None:
+        if symbol is not None and symbol.kind == "module":
+            # Module anchors are zero-width, parked at end of file, and exist
+            # only so module-level refs have a ``from_symbol_id``. Slicing
+            # their byte range returns the file's trailing characters, so the
+            # import row becomes a one-line summary instead.
+            module = (imp["module"] or "").strip().strip("'\"")
+            alias = (imp["alias"] or "").strip().strip("'\"")
+            key = (module, alias)
+            if key in seen_rows:
+                continue
+            seen_rows.add(key)
+            if module and alias:
+                if module not in summaries:
+                    summaries[module] = _summary_piece(target_path, module, "")
+                    summary_aliases[module] = []
+                    pieces.append(summaries[module])
+                summary_aliases[module].append(alias)
+            else:
+                summary = _import_summary(module, alias)
+                if summary:
+                    pieces.append(_summary_piece(target_path, module or alias, summary))
+        elif symbol is not None:
             if symbol.id in taken:
                 continue
             taken.add(symbol.id)
@@ -475,6 +609,10 @@ def _import_pieces(
         elif file_id not in seen_files:
             seen_files.add(file_id)
             pieces.append(_file_piece(target_path, reader))
+
+    for module, piece in summaries.items():
+        piece.text = _import_summary(module, ", ".join(summary_aliases[module]))
+        piece.tokens = tokens.estimate(piece.text)
     return pieces
 
 
@@ -574,6 +712,9 @@ def _test_pieces(
     matches: list[tuple[tuple[int, str, int, int], Symbol]] = []
     for row in rows:
         symbol = row_to_symbol(row)
+        # Module anchors are zero-width bookkeeping rows, not sliceable tests.
+        if symbol.kind == "module":
+            continue
         if symbol.id in taken or symbol.id == target.id:
             continue
         if _is_test_match(symbol, target, variants):
@@ -834,6 +975,7 @@ def pack(
     max_target_tokens: int = SEGMENT_THRESHOLD_TOKENS,
     segment: int | None = None,
     force: bool = False,
+    target_only: bool = False,
 ) -> Pack:
     """Pack the causal neighbourhood of ``file``:``name`` within a token budget.
 
@@ -847,10 +989,15 @@ def pack(
     When over budget, sections are trimmed in the order tests, callers, callees,
     imports, and the counts land in ``note``.
 
+    ``target_only=True`` returns just the target (or its outline) and leaves
+    every neighbour section empty: no callers, callees, imports or tests are
+    collected or expanded. Use it when only the symbol body is wanted.
+
     ``force=True`` skips the two refusals (tiny-file floor and response costing
     more than a plain read), returning the payload anyway. The usual savings
     fields are still filled in and ``note`` is prefixed with ``forced: `` so the
-    caller can judge the cost itself.
+    caller can judge the cost itself. A forced pack whose full response would
+    still cost more than a plain read is degraded to the target alone.
     """
     rel = normalize_path(file)
     # Offsets in the index are only meaningful while the file still matches
@@ -862,8 +1009,12 @@ def pack(
         )
 
     target = find_symbol(conn, rel, name) if name else _default_target(conn, rel)
+    label = f"{rel}:{name}" if name else rel
     if target is None:
-        label = f"{rel}:{name}" if name else rel
+        return Pack(note=f"target not found: {label}", worth_using=False)
+    if target.kind == "module":
+        # Module anchors are zero-width bookkeeping rows, not source symbols;
+        # slicing one would return the tail of the file.
         return Pack(note=f"target not found: {label}", worth_using=False)
 
     reader = _Reader(Path(root))
@@ -880,12 +1031,19 @@ def pack(
         )
 
     lang = _file_lang(conn, rel)
+    budget = max(0, int(budget_tokens))
+    max_target = max(0, int(max_target_tokens))
 
     if segment is not None:
         result = _pack_segment(target, reader, lang, segment, baseline)
         if force and result.target is not None:
             result.note = f"forced: {result.note}"
         return result
+
+    if target_only:
+        return _target_only_pack(
+            target, reader, lang, baseline, budget, max_target, force
+        )
 
     taken = {target.id}
     sections: dict[str, list[_Piece]] = {
@@ -901,6 +1059,9 @@ def pack(
         sections["tests"] = _test_pieces(conn, target, taken, reader)
 
     def usable(symbol: Symbol) -> bool:
+        # Module anchors are zero-width bookkeeping rows, not sliceable source.
+        if symbol.kind == "module":
+            return False
         if symbol.id in taken:
             return False
         return include_tests or not _is_test_match(symbol, target)
@@ -925,24 +1086,12 @@ def pack(
 
     sections["imports"] = _import_pieces(conn, rel, reader, taken)
 
-    target_piece = _full_piece(target, reader)
-    budget = max(0, int(budget_tokens))
-    max_target = max(0, int(max_target_tokens))
-    threshold = min(max_target, budget) if budget > 0 else max_target
-
     # Oversized targets become a signature plus an addressable outline. The
     # outline keeps the result honest: the caller still sees what the symbol
     # contains, but pays for the parts it actually needs.
-    split_segments = 0
-    if target_piece.tokens > threshold:
-        segments = _segment_target(target, reader, lang)
-        if segments:
-            outline = _signature_piece(target, reader)
-            outline.segments = segments
-            outline.truncated = True
-            outline.total_tokens = target_piece.tokens
-            target_piece = outline
-            split_segments = len(segments)
+    target_piece, split_segments = _outline_piece(
+        target, reader, lang, budget, max_target
+    )
 
     total = target_piece.tokens + sum(
         piece.tokens for items in sections.values() for piece in items
@@ -1018,16 +1167,31 @@ def pack(
     # A response that costs more than a plain read is never worth sending, even
     # when it is only marginally over: the caller would pay for the very tokens
     # this tool exists to save. Return the advice instead of the payload. A
-    # forced call returns it anyway and reports the cost in the note.
-    if baseline > 0 and response_tokens >= baseline and not force:
-        return Pack(
-            response_tokens=response_tokens,
-            token_baseline=baseline,
-            savings_pct=tokens.savings_pct(token_total, baseline),
-            worth_using=False,
-            note=(
-                f"packing would cost {response_tokens} tokens vs {baseline} "
-                "for the file; read the file directly"
+    # forced call still returns something -- but when the neighbourhood is what
+    # pushed the response over the baseline, return only the target and say so.
+    if baseline > 0 and response_tokens >= baseline:
+        if not force:
+            return Pack(
+                response_tokens=response_tokens,
+                token_baseline=baseline,
+                savings_pct=tokens.savings_pct(token_total, baseline),
+                worth_using=False,
+                note=(
+                    f"packing would cost {response_tokens} tokens vs {baseline} "
+                    "for the file; read the file directly"
+                ),
+            )
+        return _target_only_pack(
+            target,
+            reader,
+            lang,
+            baseline,
+            budget,
+            max_target,
+            force,
+            reason=(
+                f"full pack cost {response_tokens} tokens vs {baseline} "
+                "for the file, so only the target was returned"
             ),
         )
 
