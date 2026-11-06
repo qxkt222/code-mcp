@@ -18,6 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from code_mcp import tokens
 from code_mcp.config import load_config
 from code_mcp.db import open_index
 from code_mcp.graph.refs import resolve_refs
@@ -65,17 +66,22 @@ def main() -> int:
             return 1
 
         savings: list[float] = []
-        print(f"\n{'symbol':<48} {'packed':>8} {'file':>8} {'saved':>7}")
-        print("-" * 74)
+        print(f"\n{'symbol':<44} {'body':>7} {'resp':>7} {'file':>7} {'saved':>7} {'ok':>3}")
+        print("-" * 78)
         for file, name in samples:
             result = pack(conn, root, file, name)
             if result.token_total == 0:
                 continue
-            savings.append(result.savings_pct)
-            label = f"{file}:{name}"[:48]
+            # Report the serialised cost, not just the body: a pack that saves
+            # body tokens can still cost more than the file once the JSON
+            # envelope is counted.
+            effective = tokens.savings_pct(result.response_tokens, result.token_baseline)
+            savings.append(effective)
+            label = f"{file}:{name}"[:44]
             print(
-                f"{label:<48} {result.token_total:>8} "
-                f"{result.token_baseline:>8} {result.savings_pct:>6.1f}%"
+                f"{label:<44} {result.token_total:>7} {result.response_tokens:>7} "
+                f"{result.token_baseline:>7} {effective:>6.1f}% "
+                f"{'yes' if result.worth_using else 'no':>3}"
             )
 
         print("-" * 74)

@@ -51,6 +51,12 @@ _FILE_HEADER_LINES = 15
 # tool from ever being a net loss: below this the caller still saves tokens.
 PACK_CAP_RATIO = 0.7
 
+# Below this baseline the response envelope alone (one fixed JSON wrapper plus
+# a header per slice) tends to cost more than reading the file, no matter how
+# small the target is. Such files are refused outright instead of pretending
+# a pack is useful. Measured on real packs: 0-300 token files lose most often.
+MIN_PACK_BASELINE_TOKENS = 300
+
 # Absolute ceiling on expansion. Even when the baseline is huge, never grow the
 # packed result past this many tokens by pulling in neighbour bodies. Signature
 # slices still fit; whole implementations of unrelated files do not.
@@ -584,6 +590,7 @@ def _build_note(
     upgraded: int,
     worth: bool,
     split_segments: int = 0,
+    response_tokens: int | None = None,
 ) -> str:
     savings = tokens.savings_pct(total, baseline)
     summary = f"packed {total} tokens vs {baseline} baseline"
@@ -612,6 +619,22 @@ def _build_note(
     if not worth:
         if baseline <= 0:
             parts.append("not recommended: no readable file text")
+        elif response_tokens is not None:
+            # The percentage above is body-only; explain why the serialised
+            # response can still lose even when the body looks smaller.
+            effective = tokens.savings_pct(response_tokens, baseline)
+            if response_tokens >= baseline:
+                parts.append(
+                    "not recommended: including response overhead the packed "
+                    "response is not smaller than the file; "
+                    "read the file directly instead"
+                )
+            else:
+                parts.append(
+                    f"not recommended: including response overhead the saving "
+                    f"is {effective}% (body {savings}%), below the 25% "
+                    "threshold; read the file directly instead"
+                )
         elif total >= baseline:
             parts.append(
                 "not recommended: packed context is not smaller than the file; "
@@ -704,12 +727,16 @@ def _pack_segment(
         )
 
     total = piece.tokens
-    worth = tokens.worth_using(total, baseline)
-    note = _build_note(total, baseline, total, {}, 0, worth)
+    response_tokens = total + tokens.envelope_tokens([(piece.file, piece.label)])
+    worth = tokens.worth_using(response_tokens, baseline)
+    note = _build_note(
+        total, baseline, total, {}, 0, worth, response_tokens=response_tokens
+    )
     count = count or 1
     return Pack(
         target=_to_slice(piece),
         token_total=total,
+        response_tokens=response_tokens,
         token_baseline=baseline,
         savings_pct=tokens.savings_pct(total, baseline),
         worth_using=worth,
@@ -748,6 +775,16 @@ def pack(
 
     reader = _Reader(Path(root))
     baseline = tokens.estimate(reader.text(rel))
+
+    # A tiny file can never pay for the response envelope, however small the
+    # target is: reading the file directly is always the better move.
+    if baseline < MIN_PACK_BASELINE_TOKENS:
+        return Pack(
+            token_baseline=baseline,
+            worth_using=False,
+            note=f"file is only {baseline} tokens; read it directly",
+        )
+
     lang = _file_lang(conn, rel)
 
     if segment is not None:
@@ -863,7 +900,34 @@ def pack(
         for group in (caller_slices, callee_slices, import_slices, test_slices)
         for item in group
     )
-    worth = tokens.worth_using(token_total, baseline)
+    # Judge the pack on what the caller actually receives: slice bodies plus
+    # the JSON envelope that repeats every slice's metadata.
+    all_slices = [
+        target_slice,
+        *caller_slices,
+        *callee_slices,
+        *import_slices,
+        *test_slices,
+    ]
+    response_tokens = token_total + tokens.envelope_tokens(
+        [(item.file, item.symbol) for item in all_slices]
+    )
+    # A response that costs more than a plain read is never worth sending, even
+    # when it is only marginally over: the caller would pay for the very tokens
+    # this tool exists to save. Return the advice instead of the payload.
+    if baseline > 0 and response_tokens >= baseline:
+        return Pack(
+            response_tokens=response_tokens,
+            token_baseline=baseline,
+            savings_pct=tokens.savings_pct(token_total, baseline),
+            worth_using=False,
+            note=(
+                f"packing would cost {response_tokens} tokens vs {baseline} "
+                "for the file; read the file directly"
+            ),
+        )
+
+    worth = tokens.worth_using(response_tokens, baseline)
 
     return Pack(
         target=target_slice,
@@ -872,6 +936,7 @@ def pack(
         imports=import_slices,
         tests=test_slices,
         token_total=token_total,
+        response_tokens=response_tokens,
         token_baseline=baseline,
         savings_pct=tokens.savings_pct(token_total, baseline),
         worth_using=worth,
@@ -883,5 +948,6 @@ def pack(
             upgraded,
             worth,
             split_segments,
+            response_tokens=response_tokens,
         ),
     )

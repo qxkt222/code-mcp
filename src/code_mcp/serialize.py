@@ -7,6 +7,7 @@ produced: the caller can hand the result straight to ``json.dump``.
 
 from __future__ import annotations
 
+from . import tokens
 from .types import Pack, Segment, Slice
 
 
@@ -38,7 +39,17 @@ def slice_dict(slice_: Slice) -> dict:
 
 
 def pack_dict(pack: Pack) -> dict:
-    """A whole packed neighbourhood: target, neighbours, tests and budget data."""
+    """A whole packed neighbourhood: target, neighbours, tests and budget data.
+
+    ``savings_pct`` stays the body-only ratio callers already depend on;
+    ``effective_savings_pct`` charges the JSON envelope as well, which is the
+    number ``worth_using`` is based on.
+    """
+    effective = (
+        tokens.savings_pct(pack.response_tokens, pack.token_baseline)
+        if pack.response_tokens > 0
+        else 0.0
+    )
     return {
         "target": slice_dict(pack.target) if pack.target else None,
         "callers": [slice_dict(item) for item in pack.callers],
@@ -46,8 +57,10 @@ def pack_dict(pack: Pack) -> dict:
         "imports": [slice_dict(item) for item in pack.imports],
         "tests": [slice_dict(item) for item in pack.tests],
         "tokens_used": pack.token_total,
+        "response_tokens": pack.response_tokens,
         "tokens_if_read_file": pack.token_baseline,
         "savings_pct": pack.savings_pct,
+        "effective_savings_pct": effective,
         "worth_using": pack.worth_using,
         "note": pack.note,
     }

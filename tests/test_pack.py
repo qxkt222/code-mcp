@@ -7,6 +7,7 @@ import sqlite3
 from code_mcp import db, tokens
 from code_mcp.graph.refs import resolve_refs
 from code_mcp.pack import PACK_EXPAND_CAP_TOKENS, pack
+from code_mcp.serialize import pack_dict
 from code_mcp.types import CONF_NAME, REF_CALL
 
 SERVICE = '''"""Service helpers."""
@@ -53,7 +54,9 @@ def load_test():
 
 
 def _service_text() -> str:
-    padding = "\n".join(f"# padding line {index}" for index in range(1, 81))
+    # Well past MIN_PACK_BASELINE_TOKENS so the file is a realistic pack target
+    # rather than being rejected by the small-file short-circuit.
+    padding = "\n".join(f"# padding line {index}" for index in range(1, 301))
     return SERVICE + "\n" + padding + "\n"
 
 
@@ -234,6 +237,7 @@ def test_pack_reads_slice_text_from_disk(tmp_path):
 
 
 def test_pack_signature_slice_spans_multiline_declarations(tmp_path):
+    padding = "\n".join(f"# padding line {index}" for index in range(1, 121))
     source = '''@decorator
 def alpha(
     first: int,
@@ -245,7 +249,9 @@ def alpha(
 
 def caller():
     return alpha(1, "x")
-'''
+
+
+''' + padding + "\n"
     (tmp_path / "mod.py").write_text(source, encoding="utf-8", newline="\n")
 
     conn = _db(tmp_path)
@@ -308,7 +314,14 @@ def test_pack_token_accounting_matches_slices(tmp_path):
 
     assert packed.token_baseline == tokens.estimate(_service_text())
     assert packed.savings_pct == tokens.savings_pct(packed.token_total, packed.token_baseline)
-    assert packed.worth_using == tokens.worth_using(packed.token_total, packed.token_baseline)
+    # ``worth_using`` is judged on the serialised response, not the bodies.
+    assert packed.response_tokens == packed.token_total + tokens.envelope_tokens(
+        [(item.file, item.symbol) for item in slices]
+    )
+    assert packed.response_tokens > packed.token_total
+    assert packed.worth_using == tokens.worth_using(
+        packed.response_tokens, packed.token_baseline
+    )
     assert packed.worth_using is True
 
 
@@ -427,8 +440,56 @@ def test_pack_reports_missing_targets(tmp_path):
     assert "target not found" in packed.note
 
 
+def test_pack_rejects_files_below_the_baseline_floor(tmp_path):
+    conn, _ids = _fixture(tmp_path)
+    packed = pack(conn, tmp_path, "app/util.py", "parse")
+
+    assert packed.target is None
+    assert packed.token_total == 0
+    assert packed.response_tokens == 0
+    assert packed.token_baseline == tokens.estimate(UTIL)
+    assert packed.token_baseline < 300
+    assert packed.worth_using is False
+    assert f"file is only {packed.token_baseline} tokens" in packed.note
+    assert "read it directly" in packed.note
+
+
+def test_pack_note_explains_when_envelope_breaks_the_deal(tmp_path, monkeypatch):
+    conn, _ids = _fixture(tmp_path)
+    # Force the envelope to dominate while leaving the bodies untouched.
+    monkeypatch.setattr(tokens, "envelope_tokens", lambda slices: 10**6)
+
+    packed = pack(conn, tmp_path, "app/service.py", "load", budget_tokens=10**6)
+
+    assert packed.worth_using is False
+    assert packed.savings_pct > 0  # the bodies alone are smaller than the file
+    # The payload is withheld entirely rather than sent with a warning.
+    assert packed.target is None
+    assert "would cost" in packed.note
+    assert "read the file directly" in packed.note
+
+
+def test_pack_dict_exposes_envelope_accounting(tmp_path):
+    conn, _ids = _fixture(tmp_path)
+    packed = pack(conn, tmp_path, "app/service.py", "load", budget_tokens=10**6)
+    data = pack_dict(packed)
+
+    assert data["tokens_used"] == packed.token_total
+    assert data["response_tokens"] == packed.response_tokens
+    assert data["savings_pct"] == packed.savings_pct
+    assert data["effective_savings_pct"] == tokens.savings_pct(
+        packed.response_tokens, packed.token_baseline
+    )
+
+    small = pack_dict(pack(conn, tmp_path, "app/util.py", "parse"))
+    assert small["worth_using"] is False
+    assert small["response_tokens"] == 0
+    assert small["effective_savings_pct"] == 0.0
+
+
 def test_pack_normalises_crlf_line_endings(tmp_path):
-    raw = "def alpha():\r\n    return 1\r\n"
+    padding = "".join(f"# padding line {index}\r\n" for index in range(1, 121))
+    raw = "def alpha():\r\n    return 1\r\n" + padding
     (tmp_path / "mod.py").write_bytes(raw.encode("utf-8"))
 
     conn = _db(tmp_path)
@@ -619,7 +680,10 @@ def test_neighbour_expansion_has_an_absolute_cap(tmp_path):
 
 def test_import_without_a_matching_symbol_stays_a_header(tmp_path):
     helpers = "".join(f"def helper_{index}():\n    return {index}\n\n" for index in range(100))
-    service = "from app.helpers import add\n\n\ndef run():\n    return add(1)\n"
+    padding = "\n".join(f"# padding line {index}" for index in range(1, 121))
+    service = (
+        "from app.helpers import add\n\n\ndef run():\n    return add(1)\n\n" + padding + "\n"
+    )
 
     conn = _db(tmp_path)
     helpers_id = _write(conn, tmp_path, "app/helpers.py", helpers)
@@ -647,7 +711,8 @@ def test_import_without_a_matching_symbol_stays_a_header(tmp_path):
 
 
 def test_test_prefilter_keeps_multi_part_names(tmp_path):
-    target = "def fetch_user_data():\n    return 1\n"
+    padding = "\n".join(f"# padding line {index}" for index in range(1, 121))
+    target = "def fetch_user_data():\n    return 1\n\n" + padding + "\n"
     tests = (
         "def test_fetch_user_data():\n    pass\n\n\n"
         "def fetch_user_data_test():\n    pass\n\n\n"

@@ -10,6 +10,16 @@ from __future__ import annotations
 ASCII_CHARS_PER_TOKEN = 3.8
 NON_ASCII_CHARS_PER_TOKEN = 1.4
 
+# Every packed slice is wrapped in a JSON envelope carrying its file, symbol,
+# kind, line range, token count and truncated/segment metadata. Those keys are
+# invisible in the source text, so a pack that saves body tokens can still cost
+# more than a plain read once serialised. The constants below fit that overhead
+# against real serialised responses: a fixed base per response, a charge per
+# slice, and a multiple of the file/symbol names repeated in every header.
+ENVELOPE_BASE = 60
+ENVELOPE_PER_SLICE = 30
+ENVELOPE_META_RATIO = 1.5
+
 
 def estimate(text: str) -> int:
     """Estimate the token count of ``text`` for mixed English/CJK source code."""
@@ -19,6 +29,20 @@ def estimate(text: str) -> int:
     ascii_count = len(text) - non_ascii
     tokens = ascii_count / ASCII_CHARS_PER_TOKEN + non_ascii / NON_ASCII_CHARS_PER_TOKEN
     return max(1, int(tokens))
+
+
+def envelope_tokens(slices: list[tuple[str, str]]) -> int:
+    """Approximate the JSON envelope cost for ``(file, symbol)`` pairs.
+
+    Returns 0 for an empty response. ``meta`` sums the estimated cost of every
+    file and symbol name that the serialiser repeats in each slice header.
+    """
+    if not slices:
+        return 0
+    meta = sum(estimate(file) + estimate(symbol) for file, symbol in slices)
+    return int(
+        ENVELOPE_BASE + ENVELOPE_PER_SLICE * len(slices) + meta * ENVELOPE_META_RATIO
+    )
 
 
 def savings_pct(packed: int, baseline: int) -> float:

@@ -128,7 +128,9 @@ class Pack:
 
     ``token_baseline`` is what reading the whole containing file(s) would cost;
     ``worth_using`` is False when packing saved nothing, so callers can fall
-    back to a plain read instead of trusting the tool blindly.
+    back to a plain read instead of trusting the tool blindly. ``token_total``
+    counts slice bodies only; ``response_tokens`` adds the serialised JSON
+    envelope and is what ``worth_using`` is judged on.
     """
 
     target: Slice | None = None
@@ -137,6 +139,7 @@ class Pack:
     imports: list[Slice] = field(default_factory=list)
     tests: list[Slice] = field(default_factory=list)
     token_total: int = 0
+    response_tokens: int = 0
     token_baseline: int = 0
     savings_pct: float = 0.0
     worth_using: bool = True
