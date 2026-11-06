@@ -358,9 +358,21 @@ def _target_only_pack(
         split_segments,
         response_tokens=response_tokens,
     )
-    note += "; target only: neighbour sections omitted; use include_* to fetch them"
     if reason:
-        note += f"; {reason}"
+        # Degraded from a full pack because the full response costs more than
+        # a plain read. Say what was dropped, why, and what to do instead.
+        note += f"; target only: {reason}"
+        if "read the file directly" not in note:
+            note += "; read the file directly to get the rest"
+    else:
+        # Explicit target_only request. There is no include_* parameter to
+        # point at: the neighbour sections are switched back on by dropping
+        # target_only (CLI: --target-only).
+        note += (
+            "; target only: neighbour sections omitted; "
+            "drop target_only/--target-only to include callers, callees, "
+            "imports and tests"
+        )
     if force:
         note = f"forced: {note}"
     return Pack(
@@ -1191,7 +1203,7 @@ def pack(
             force,
             reason=(
                 f"full pack cost {response_tokens} tokens vs {baseline} "
-                "for the file, so only the target was returned"
+                "for a plain read, so only the target was returned"
             ),
         )
 

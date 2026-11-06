@@ -31,8 +31,17 @@ def _open(path: str):
 
 
 def _print_json(payload: dict) -> None:
-    """Emit one JSON response; every command reports its own token cost."""
-    json.dump(with_response_tokens(payload), sys.stdout, ensure_ascii=False, indent=2)
+    """Emit one JSON response; every command reports its own token cost.
+
+    The cost is measured with the same ``indent=2`` used to print it: the
+    compact estimate would under-report the real output by about a third.
+    """
+    json.dump(
+        with_response_tokens(payload, indent=2),
+        sys.stdout,
+        ensure_ascii=False,
+        indent=2,
+    )
     sys.stdout.write("\n")
 
 
@@ -395,7 +404,10 @@ def build_parser() -> argparse.ArgumentParser:
     pack_parser.add_argument(
         "--force",
         action="store_true",
-        help="return the pack even when it costs more than reading the file",
+        help=(
+            "return a pack even when it costs more than reading the file; "
+            "the target alone is returned when the full neighbourhood loses"
+        ),
     )
     pack_parser.add_argument(
         "--target-only",

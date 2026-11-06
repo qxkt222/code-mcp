@@ -13,17 +13,22 @@ from . import tokens
 from .types import GateResult, Pack, Segment, Slice
 
 
-def with_response_tokens(payload: dict) -> dict:
+def with_response_tokens(payload: dict, *, indent: int | None = None) -> dict:
     """Attach the serialised cost of this payload to itself.
 
     The estimate is taken before the field is written, so the reported number
     covers the whole response except the ``response_tokens`` key itself. A
     payload that already reports its own envelope cost (``pack``) keeps that
     value: this helper only fills in the commands that had no cost field.
+
+    ``indent`` must match the formatting the caller actually emits. Indented
+    JSON is roughly a third larger than the compact form, so a caller that
+    pretty-prints (the CLI uses ``indent=2``) has to say so or the reported
+    cost understates every response.
     """
     if "response_tokens" not in payload:
         payload["response_tokens"] = tokens.estimate(
-            json.dumps(payload, ensure_ascii=False)
+            json.dumps(payload, ensure_ascii=False, indent=indent)
         )
     return payload
 

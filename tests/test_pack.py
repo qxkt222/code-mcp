@@ -1166,6 +1166,24 @@ def test_with_response_tokens_measures_the_payload_without_itself():
     )
 
 
+def test_with_response_tokens_measures_pretty_printed_output():
+    from code_mcp.serialize import with_response_tokens
+
+    payload = {
+        "symbols": [{"file": "a.py", "qualname": "alpha", "kind": "function"}],
+        "comments": [],
+    }
+    compact = with_response_tokens(dict(payload))["response_tokens"]
+    pretty = with_response_tokens(dict(payload), indent=2)["response_tokens"]
+
+    assert pretty == tokens.estimate(
+        json.dumps(payload, ensure_ascii=False, indent=2)
+    )
+    # Indentation and newlines make the real output materially larger, which
+    # is why the CLI must not measure the compact form.
+    assert pretty > compact
+
+
 def test_with_response_tokens_keeps_pack_existing_cost(tmp_path):
     from code_mcp.serialize import with_response_tokens
 
@@ -1184,7 +1202,7 @@ def test_cli_json_output_reports_response_tokens(capsys):
 
     assert payload["response_tokens"] > 0
     assert payload["response_tokens"] == tokens.estimate(
-        json.dumps({"symbols": [], "comments": []}, ensure_ascii=False)
+        json.dumps({"symbols": [], "comments": []}, ensure_ascii=False, indent=2)
     )
 
 
@@ -1224,7 +1242,8 @@ def test_pack_target_only_returns_the_target_and_no_neighbours(tmp_path):
     assert packed.imports == []
     assert packed.tests == []
     assert "target only: neighbour sections omitted" in packed.note
-    assert "use include_* to fetch them" in packed.note
+    assert "drop target_only/--target-only" in packed.note
+    assert "include_*" not in packed.note
 
 
 def test_pack_target_only_still_segments_an_oversized_target(tmp_path):
@@ -1267,8 +1286,11 @@ def test_force_degrades_to_the_target_when_the_envelope_loses(tmp_path, monkeypa
     assert packed.imports == []
     assert packed.tests == []
     assert packed.note.startswith("forced: ")
-    assert "target only: neighbour sections omitted" in packed.note
+    assert "target only:" in packed.note
     assert "full pack cost" in packed.note
+    # The degradation note must not point at a parameter that does not exist.
+    assert "include_*" not in packed.note
+    assert "read the file directly" in packed.note
 
 
 def test_server_pack_exposes_target_only(tmp_path, monkeypatch):
