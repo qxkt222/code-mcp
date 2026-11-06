@@ -28,7 +28,10 @@ import tree_sitter_typescript
 from tree_sitter import Language, Node, Parser
 
 from .db import open_index
+from .graph.refs import resolve_refs
+from .graph.tauri import build_bridges
 from .index.builder import reindex_file
+from .paths import resolve_within
 from .types import EditResult
 
 MAX_DIFF_LINES = 200
@@ -116,7 +119,7 @@ def replace_symbol(
         result.reason = "new_code is empty"
         return result
 
-    path = _target_path(root, rel)
+    path = resolve_within(root, rel)
     if path is None:
         result.reason = "file is outside the repository root"
         return result
@@ -180,6 +183,13 @@ def replace_symbol(
         # edited range has shifted, and a stale offset would make the next edit
         # rewrite the wrong bytes.
         reindex_file(root, conn, rel)
+        # Replacing the file row cascaded its symbols away, so every ref that
+        # pointed at them now has ``to_symbol_id = NULL``. Rebuild those edges
+        # (and the Tauri bridges) before reporting success; otherwise impact()
+        # silently goes empty after the first edit.
+        resolve_refs(conn)
+        build_bridges(conn)
+        conn.commit()
 
         result.applied = True
         result.new_hash = new_hash
@@ -195,23 +205,14 @@ def _relative_path(root: Path, file: str) -> str | None:
         return None
     candidate = Path(raw)
     if candidate.is_absolute():
-        try:
-            return candidate.resolve().relative_to(root.resolve()).as_posix()
-        except (OSError, ValueError):
+        target = resolve_within(root, raw)
+        if target is None:
             return None
+        return target.relative_to(root.resolve()).as_posix()
     normalized = raw.replace("\\", "/")
     while normalized.startswith("./"):
         normalized = normalized[2:]
     return normalized or None
-
-
-def _target_path(root: Path, rel: str) -> Path | None:
-    try:
-        path = (root / rel).resolve()
-        path.relative_to(root.resolve())
-    except (OSError, ValueError):
-        return None
-    return path
 
 
 def _lookup_symbol(conn: sqlite3.Connection, rel: str, name: str) -> sqlite3.Row | None:

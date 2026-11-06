@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from code_mcp import db
+from code_mcp.config import DEFAULT_EXCLUDES, Config
 from code_mcp.edit import replace_symbol
+from code_mcp.graph.impact import impact
+from code_mcp.graph.refs import resolve_refs
+from code_mcp.index.builder import build_index
+from code_mcp.index.modules import resolve_imports
+from code_mcp.paths import resolve_within
 
 PY_SOURCE = (
     b"import os\n"
@@ -364,3 +370,113 @@ def test_index_hash_updated_after_apply(tmp_path: Path) -> None:
     assert result.applied is True
     written = (tmp_path / "pkg/mod.py").read_bytes()
     assert _indexed_hash(tmp_path, "pkg/mod.py") == hashlib.sha256(written).hexdigest()
+
+
+def _symbol_id(conn, rel: str, name: str) -> int | None:
+    row = conn.execute(
+        """SELECT s.id FROM symbols AS s JOIN files AS f ON f.id = s.file_id
+           WHERE f.path = ? AND s.name = ?
+           ORDER BY s.start_line, s.id LIMIT 1""",
+        (rel, name),
+    ).fetchone()
+    return int(row["id"]) if row is not None else None
+
+
+def test_edit_reconnects_refs_and_keeps_impact_non_empty(tmp_path: Path) -> None:
+    """A1: replacing a file row cascade-nulls incoming refs; the edit must
+    re-resolve them or impact() silently returns nothing."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text(
+        "def helper(x):\n    return x + 1\n", encoding="utf-8"
+    )
+    (root / "b.py").write_text(
+        "from a import helper\n\n\ndef caller():\n    return helper(1)\n",
+        encoding="utf-8",
+    )
+
+    conn = db.open_index(root)
+    try:
+        build_index(root, conn, Config(root=root, excludes=list(DEFAULT_EXCLUDES)))
+        resolve_imports(conn, root)
+        resolve_refs(conn)
+        before_id = _symbol_id(conn, "a.py", "helper")
+        assert before_id is not None
+        assert any(node.symbol.name == "caller" for node in impact(conn, before_id))
+    finally:
+        conn.close()
+
+    result = replace_symbol(
+        root, "a.py", "helper", "def helper(x):\n    return x + 2\n"
+    )
+    assert result.applied is True, result.reason
+
+    conn = db.open_index(root)
+    try:
+        helper_id = _symbol_id(conn, "a.py", "helper")
+        assert helper_id is not None
+        row = conn.execute(
+            """SELECT r.to_symbol_id FROM refs AS r
+               JOIN symbols AS s ON s.id = r.from_symbol_id
+               JOIN files AS f ON f.id = s.file_id
+               WHERE f.path = 'b.py' AND r.to_name = 'helper'"""
+        ).fetchone()
+        assert row is not None and row["to_symbol_id"] == helper_id
+
+        nodes = impact(conn, helper_id)
+        assert any(node.symbol.name == "caller" for node in nodes)
+    finally:
+        conn.close()
+
+
+def test_replace_symbol_rejects_relative_and_absolute_escapes(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    outside = tmp_path / "outside.py"
+    outside.write_text("def target():\n    pass\n", encoding="utf-8")
+
+    for candidate in ("../outside.py", str(outside)):
+        result = replace_symbol(
+            root, candidate, "target", "def target():\n    return 1\n"
+        )
+        assert result.applied is False
+        assert "outside the repository root" in result.reason
+    assert outside.read_text(encoding="utf-8") == "def target():\n    pass\n"
+
+
+def test_replace_symbol_rejects_symlink_escape(tmp_path: Path) -> None:
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret.py"
+    secret.write_text("def target():\n    pass\n", encoding="utf-8")
+    root = tmp_path / "repo"
+    root.mkdir()
+    link = root / "link.py"
+    try:
+        link.symlink_to(secret)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+
+    result = replace_symbol(root, "link.py", "target", "def target():\n    return 1\n")
+    assert result.applied is False
+    assert "outside the repository root" in result.reason
+
+
+def test_resolve_within_covers_escape_cases(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "inside.py").write_text("", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    assert resolve_within(root, "inside.py") == (root / "inside.py").resolve()
+    assert resolve_within(root, "../outside.txt") is None
+    assert resolve_within(root, str(outside)) is None
+    assert resolve_within(root, "") is None
+
+    link = root / "link.txt"
+    try:
+        link.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable on this platform")
+    assert resolve_within(root, "link.txt") is None

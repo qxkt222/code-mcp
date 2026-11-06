@@ -223,7 +223,9 @@ def test_run_external_continues_when_one_tool_is_missing(
 # --------------------------------------------------------------------------- #
 
 
-def _add_file(conn, root: Path, rel: str, text: str) -> tuple[int, bytes]:
+def _add_file(
+    conn, root: Path, rel: str, text: str, lang: str = "python"
+) -> tuple[int, bytes]:
     data = text.encode("utf-8")
     path = root / rel
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -232,7 +234,7 @@ def _add_file(conn, root: Path, rel: str, text: str) -> tuple[int, bytes]:
         "INSERT INTO files(path, lang, mtime, hash, loc) VALUES (?, ?, ?, ?, ?)",
         (
             rel,
-            "python",
+            lang,
             path.stat().st_mtime,
             "0" * 64,
             data.count(b"\n"),
@@ -292,8 +294,9 @@ def test_long_function(tmp_path: Path) -> None:
 
     findings = [finding for finding in analyze(conn) if finding.rule == "long-function"]
 
+    # 82 lines over the Python limit of 80, but under twice the limit.
     assert len(findings) == 1
-    assert findings[0].severity == "P1"
+    assert findings[0].severity == "P2"
     assert findings[0].symbol == "long_one"
     assert findings[0].file == "pkg/long.py"
 

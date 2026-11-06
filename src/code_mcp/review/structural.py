@@ -1,20 +1,33 @@
 """Structural review rules computed from the index plus the files it describes.
 
 Only the SQLite index and the source files referenced by it are read. Nesting
-depth is approximated from indentation width (4 spaces per level); no
+depth is approximated from the indentation of control-keyword lines only, with
+the indent unit inferred per file (two spaces in TS/JS, four in Python); no
 cyclomatic-complexity dependency is used.
 """
 
 from __future__ import annotations
 
 import hashlib
+import math
+import re
 import sqlite3
 import textwrap
 from pathlib import Path
 
+from ..paths import is_test_path
 from ..types import Finding, REF_CALL
 
-LONG_FUNCTION_LINES = 80
+# UI components legitimately run long, so the limit is per language. Only a
+# function more than twice the limit is treated as P1.
+LONG_FUNCTION_LINES: dict[str, int] = {
+    "python": 80,
+    "rust": 80,
+    "typescript": 150,
+    "tsx": 250,
+    "javascript": 150,
+}
+DEFAULT_LONG_FUNCTION_LINES = 80
 DEEP_NESTING_LEVELS = 5
 HIGH_FANOUT = 15
 HIGH_FANIN = 20
@@ -22,6 +35,13 @@ DUPLICATE_MIN_LINES = 10
 
 _FUNCTION_KINDS = ("function", "method")
 _SYMBOL_KINDS = ("function", "method", "class")
+# Test discovery for JS/TS has no reliable signal yet, so the rule is skipped
+# there rather than reporting false positives.
+_NO_TESTS_SKIP_LANGS = {"typescript", "tsx", "javascript"}
+_CONTROL = re.compile(
+    r"^(?:if|elif|else|for|while|match|loop|switch|case|default|"
+    r"try|catch|finally|except|with|do)\b"
+)
 
 _SYMBOL_QUERY = (
     "SELECT s.id, s.name, s.qualname, s.kind, s.start_line, s.end_line, "
@@ -78,16 +98,17 @@ def _long_functions(symbols: list[sqlite3.Row]) -> list[Finding]:
     for symbol in symbols:
         if symbol["kind"] not in _FUNCTION_KINDS:
             continue
+        limit = LONG_FUNCTION_LINES.get(symbol["lang"] or "", DEFAULT_LONG_FUNCTION_LINES)
         length = int(symbol["end_line"]) - int(symbol["start_line"]) + 1
-        if length <= LONG_FUNCTION_LINES:
+        if length <= limit:
             continue
         findings.append(
             Finding(
                 rule="long-function",
-                severity="P1",
+                severity="P1" if length > 2 * limit else "P2",
                 file=symbol["file"],
                 line=int(symbol["start_line"]),
-                message=f"{_label(symbol)} is {length} lines long (limit {LONG_FUNCTION_LINES})",
+                message=f"{_label(symbol)} is {length} lines long (limit {limit})",
                 symbol=_label(symbol),
             )
         )
@@ -104,7 +125,7 @@ def _deep_nesting(
         text = _symbol_text(symbol, root, cache)
         if text is None:
             continue
-        depth = _max_indent_level(text)
+        depth = _max_control_depth(text)
         if depth <= DEEP_NESTING_LEVELS:
             continue
         findings.append(
@@ -221,7 +242,7 @@ def _missing_docstrings(symbols: list[sqlite3.Row]) -> list[Finding]:
         if symbol["kind"] not in _SYMBOL_KINDS:
             continue
         name = symbol["name"]
-        if name.startswith("_") or _is_test_path(symbol["file"]):
+        if name.startswith("_") or is_test_path(symbol["file"]):
             continue
         if (symbol["docstring"] or "").strip():
             continue
@@ -244,15 +265,17 @@ def _no_tests(conn: sqlite3.Connection, symbols: list[sqlite3.Row]) -> list[Find
         "SELECT s.name, f.path AS file FROM symbols s JOIN files f ON f.id = s.file_id"
     ).fetchall()
     for row in rows:
-        if _is_test_path(row["file"]):
+        if is_test_path(row["file"]):
             test_names.add(row["name"])
 
     findings: list[Finding] = []
     for symbol in symbols:
         if symbol["kind"] not in _SYMBOL_KINDS:
             continue
+        if symbol["lang"] in _NO_TESTS_SKIP_LANGS:
+            continue
         name = symbol["name"]
-        if name.startswith("_") or _is_test_path(symbol["file"]):
+        if name.startswith("_") or is_test_path(symbol["file"]):
             continue
         candidates = {f"test_{name}", f"{name}_test"}
         if symbol["kind"] == "class":
@@ -306,16 +329,45 @@ def _file_bytes(
     return data
 
 
-def _max_indent_level(text: str) -> int:
+def _indent_unit(lines: list[str]) -> int:
+    """Most common positive gap between distinct indent widths; 1..8.
+
+    TS/JS commonly indent by two spaces and Python by four, so a fixed unit
+    would under- or over-count one of them by a factor of two. The GCD of the
+    gaps between the distinct indentation widths of the file's non-empty lines
+    recovers the unit the file actually uses. Tabs already count as four
+    columns in ``_indent_width``. With no usable data the default is four.
+    """
+    widths = sorted({_indent_width(line) for line in lines if line.strip()})
+    if len(widths) < 2:
+        return 4
+    unit = 0
+    for left, right in zip(widths, widths[1:]):
+        unit = math.gcd(unit, right - left)
+    if unit <= 0:
+        return 4
+    return min(8, max(1, unit))
+
+
+def _max_control_depth(text: str) -> int:
+    """Deepest indentation among lines that open a control construct.
+
+    Raw indentation is not nesting: JSX attributes, wrapped call arguments and
+    object continuations all sit deep without branching. Requiring a control
+    keyword keeps the rule focused on actual control flow. The indent width of
+    one level is inferred from the file itself.
+    """
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     if not lines:
         return 0
     base = _indent_width(lines[0])
+    unit = _indent_unit(lines)
     deepest = 0
     for line in lines[1:]:
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped or not _CONTROL.match(stripped):
             continue
-        deepest = max(deepest, (_indent_width(line) - base) // 4)
+        deepest = max(deepest, (_indent_width(line) - base) // unit)
     return max(deepest, 0)
 
 
@@ -340,13 +392,3 @@ def _indent_width(line: str) -> int:
         else:
             break
     return width
-
-
-def _is_test_path(path: str) -> bool:
-    normalized = path.replace("\\", "/")
-    parts = normalized.split("/")
-    filename = parts[-1]
-    stem = filename.rsplit(".", 1)[0]
-    if stem == "test" or stem.startswith("test_") or stem.endswith("_test"):
-        return True
-    return any(part in {"tests", "test", "__tests__"} for part in parts[:-1])

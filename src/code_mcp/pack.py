@@ -9,7 +9,7 @@ from disk, never reconstructed from index summaries.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import tokens
@@ -22,14 +22,22 @@ from .graph.refs import (
     normalize_path,
     row_to_symbol,
 )
-from .types import FILE_KIND, Pack, Slice, Symbol
+from .index.chunks import (
+    SEGMENT_MAX_TOKENS,
+    SEGMENT_THRESHOLD_TOKENS,
+    segment_symbol,
+)
+from .paths import is_test_path
+from .types import FILE_KIND, Pack, Segment, Slice, Symbol
 
 # Over-budget sections are emptied in this order (least essential first).
 # Tests are the last thing dropped: knowing which tests cover the symbol is
 # worth more than a few extra import lines.
 _TRIM_ORDER = ("imports", "callees", "callers", "tests")
-# Surplus budget expands sections in this order.
-_UPGRADE_ORDER = ("callers", "callees", "imports")
+# Surplus budget expands sections in this order. Imports are deliberately
+# absent: expanding one import used to mean pasting an entire unrelated file,
+# which dominated the packed cost.
+_UPGRADE_ORDER = ("callers", "callees")
 _SECTION_LABELS = {
     "tests": "test(s)",
     "callers": "caller(s)",
@@ -42,6 +50,16 @@ _FILE_HEADER_LINES = 15
 # Ceiling on packed cost as a fraction of the plain-read baseline. Keeps the
 # tool from ever being a net loss: below this the caller still saves tokens.
 PACK_CAP_RATIO = 0.7
+
+# Absolute ceiling on expansion. Even when the baseline is huge, never grow the
+# packed result past this many tokens by pulling in neighbour bodies. Signature
+# slices still fit; whole implementations of unrelated files do not.
+PACK_EXPAND_CAP_TOKENS = 4000
+
+# If imports ever become expandable again, a single import may only pull in a
+# small definition, never a whole file.
+_IMPORT_EXPAND_MAX_LINES = 40
+_IMPORT_EXPAND_MAX_TOKENS = 300
 
 _PY_SUFFIXES = (".py", "/__init__.py")
 _WEB_SUFFIXES = ("", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
@@ -58,17 +76,22 @@ class _Reader:
 
     def __init__(self, root: Path) -> None:
         self.root = root
+        self._raw: dict[str, bytes] = {}
         self._text: dict[str, str] = {}
         self._lines: dict[str, list[str]] = {}
 
+    def raw(self, rel: str) -> bytes:
+        """Raw bytes, which is what index byte offsets refer to."""
+        if rel not in self._raw:
+            try:
+                self._raw[rel] = (self.root / rel).read_bytes()
+            except OSError:
+                self._raw[rel] = b""
+        return self._raw[rel]
+
     def text(self, rel: str) -> str:
         if rel not in self._text:
-            try:
-                raw = (self.root / rel).read_bytes()
-            except OSError:
-                self._text[rel] = ""
-            else:
-                self._text[rel] = raw.decode("utf-8", errors="replace")
+            self._text[rel] = self.raw(rel).decode("utf-8", errors="replace")
         return self._text[rel]
 
     def lines(self, rel: str) -> list[str]:
@@ -100,6 +123,10 @@ class _Piece:
     full: bool
     text: str = ""
     tokens: int = 0
+    # Carried onto the Slice when an oversized symbol is reduced to an outline.
+    segments: list[Segment] = field(default_factory=list)
+    truncated: bool = False
+    total_tokens: int = 0
 
 
 def _label(symbol: Symbol) -> str:
@@ -234,21 +261,12 @@ def _file_piece(rel: str, reader: _Reader) -> _Piece:
 def _expand(piece: _Piece, reader: _Reader) -> _Piece:
     if piece.full:
         return piece
-    if piece.symbol is not None:
-        return _full_piece(piece.symbol, reader)
-    lines = reader.lines(piece.file)
-    start, end, text = reader.slice(piece.file, 1, max(1, len(lines)))
-    return _Piece(
-        symbol=None,
-        file=piece.file,
-        start_line=start,
-        end_line=end,
-        kind=piece.kind,
-        label=piece.label,
-        full=True,
-        text=text,
-        tokens=tokens.estimate(text),
-    )
+    # A piece without a symbol is a whole-file header (an import that resolved
+    # to no specific definition). Expanding it would paste an unrelated file,
+    # so it is never upgradeable.
+    if piece.symbol is None:
+        return piece
+    return _full_piece(piece.symbol, reader)
 
 
 def _to_slice(piece: _Piece) -> Slice:
@@ -260,6 +278,9 @@ def _to_slice(piece: _Piece) -> Slice:
         symbol=piece.label,
         kind=piece.kind,
         tokens=piece.tokens,
+        segments=list(piece.segments),
+        truncated=piece.truncated,
+        total_tokens=piece.total_tokens,
     )
 
 
@@ -443,29 +464,6 @@ def _import_pieces(
 # Tests
 # --------------------------------------------------------------------------- #
 
-_TEST_SUFFIXES = (
-    ".test.ts",
-    ".test.tsx",
-    ".test.js",
-    ".test.jsx",
-    ".spec.ts",
-    ".spec.tsx",
-    ".spec.js",
-    ".spec.jsx",
-)
-
-
-def _is_test_path(path: str) -> bool:
-    name = path.rsplit("/", 1)[-1]
-    if name.startswith("test_") and name.endswith(".py"):
-        return True
-    if name.endswith("_test.py"):
-        return True
-    if name.endswith(_TEST_SUFFIXES):
-        return True
-    return "/tests/" in f"/{path}"
-
-
 def _test_variants(name: str, qualname: str) -> set[str]:
     variants: set[str] = set()
     for base in (name, qualname):
@@ -496,10 +494,14 @@ def _name_parts(name: str) -> set[str]:
     return {part for part in _split_ident(name) if part}
 
 
-def _is_test_match(symbol: Symbol, target: Symbol) -> bool:
-    if symbol.name in _test_variants(target.name, target.qualname):
+def _is_test_match(
+    symbol: Symbol, target: Symbol, variants: set[str] | None = None
+) -> bool:
+    if variants is None:
+        variants = _test_variants(target.name, target.qualname)
+    if symbol.name in variants:
         return True
-    if not _is_test_path(symbol.file):
+    if not is_test_path(symbol.file):
         return False
     if not symbol.name.startswith("test"):
         return False
@@ -508,20 +510,47 @@ def _is_test_match(symbol: Symbol, target: Symbol) -> bool:
     return bool(wanted) and wanted.issubset(present)
 
 
-def _test_rank(symbol: Symbol, target: Symbol) -> tuple[int, str, int, int]:
-    exact = symbol.name in _test_variants(target.name, target.qualname)
+def _test_rank(
+    symbol: Symbol, target: Symbol, variants: set[str] | None = None
+) -> tuple[int, str, int, int]:
+    if variants is None:
+        variants = _test_variants(target.name, target.qualname)
+    exact = symbol.name in variants
     return (0 if exact else 1, symbol.file, symbol.start_line, symbol.id)
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE wildcards so a symbol name is matched literally."""
+    return (
+        value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
+
+
+def _like_needle(name: str) -> str:
+    """Longest identifier part of ``name``, used as a cheap SQL prefilter.
+
+    Every name this module can match against ``target`` contains at least one
+    part of the target's bare name (test variants join the parts with
+    underscores, and the prefix rule requires each part to appear), so the
+    longest part is a safe superset filter.
+    """
+    parts = _split_ident(name)
+    return max(parts, key=len) if parts else name
 
 
 def _test_pieces(
     conn: sqlite3.Connection, target: Symbol, taken: set[int], reader: _Reader
 ) -> list[_Piece]:
+    variants = _test_variants(target.name, target.qualname)
+    pattern = f"%{_like_escape(_like_needle(target.name))}%"
     rows = conn.execute(
         f"""SELECT {SYMBOL_COLUMNS}
             FROM symbols AS s
             JOIN files AS f ON f.id = s.file_id
-            WHERE s.name LIKE '%test%' OR f.path LIKE '%test%'
-            ORDER BY f.path, s.start_line, s.id"""
+            WHERE (s.name LIKE '%test%' OR f.path LIKE '%test%')
+              AND s.name LIKE ? ESCAPE '\\'
+            ORDER BY f.path, s.start_line, s.id""",
+        (pattern,),
     ).fetchall()
 
     matches: list[tuple[tuple[int, str, int, int], Symbol]] = []
@@ -529,8 +558,8 @@ def _test_pieces(
         symbol = row_to_symbol(row)
         if symbol.id in taken or symbol.id == target.id:
             continue
-        if _is_test_match(symbol, target):
-            matches.append((_test_rank(symbol, target), symbol))
+        if _is_test_match(symbol, target, variants):
+            matches.append((_test_rank(symbol, target, variants), symbol))
     matches.sort(key=lambda item: item[0])
 
     pieces: list[_Piece] = []
@@ -554,6 +583,7 @@ def _build_note(
     trimmed: dict[str, int],
     upgraded: int,
     worth: bool,
+    split_segments: int = 0,
 ) -> str:
     savings = tokens.savings_pct(total, baseline)
     summary = f"packed {total} tokens vs {baseline} baseline"
@@ -572,6 +602,11 @@ def _build_note(
         parts.append(f"over budget {budget}: trimmed {detail}")
     if total > budget:
         parts.append(f"target alone exceeds budget {budget}")
+    if split_segments:
+        parts.append(
+            f"target split into {split_segments} segments; "
+            "fetch one with slice(file, start_line, end_line)"
+        )
     if upgraded:
         parts.append(f"expanded {upgraded} slice(s) to full body")
     if not worth:
@@ -590,6 +625,98 @@ def _build_note(
     return "; ".join(parts)
 
 
+def _file_lang(conn: sqlite3.Connection, rel: str) -> str:
+    row = conn.execute("SELECT lang FROM files WHERE path = ?", (rel,)).fetchone()
+    return row["lang"] if row is not None else ""
+
+
+def _line_byte_range(source: bytes, start_line: int, end_line: int) -> tuple[int, int]:
+    """Byte offsets for an inclusive 1-based line range, for stale index rows."""
+    lines = source.splitlines(keepends=True)
+    if not lines:
+        return 0, 0
+    first = min(max(1, start_line), len(lines))
+    last = min(max(first, end_line), len(lines))
+    start = sum(len(line) for line in lines[: first - 1])
+    end = start + sum(len(line) for line in lines[first - 1 : last])
+    return start, min(end, len(source))
+
+
+def _target_bytes(target: Symbol, reader: _Reader) -> tuple[bytes, int, int]:
+    """Raw source plus byte offsets; derive offsets when the index has none."""
+    source = reader.raw(target.file)
+    start, end = target.start_byte, target.end_byte
+    if 0 <= start < end <= len(source):
+        return source, start, end
+    start, end = _line_byte_range(source, target.start_line, target.end_line)
+    return source, start, end
+
+
+def _segment_target(target: Symbol, reader: _Reader, lang: str) -> list[Segment]:
+    source, start, end = _target_bytes(target, reader)
+    if start >= end:
+        return []
+    return segment_symbol(source, lang, start, end, SEGMENT_MAX_TOKENS)
+
+
+def _pack_segment(
+    target: Symbol, reader: _Reader, lang: str, segment: int, baseline: int
+) -> Pack:
+    """Return exactly one block of a segmented symbol."""
+    label = _label(target)
+    segments = _segment_target(target, reader, lang)
+    count = len(segments)
+
+    if count == 0:
+        if segment != 1:
+            return Pack(
+                note=(
+                    f"segment {segment} out of range: "
+                    f"{target.file}:{label} has 1 segment"
+                ),
+                worth_using=False,
+            )
+        piece = _full_piece(target, reader)
+    else:
+        if segment < 1 or segment > count:
+            unit = "segment" if count == 1 else "segments"
+            return Pack(
+                note=(
+                    f"segment {segment} out of range: "
+                    f"{target.file}:{label} has {count} {unit}"
+                ),
+                worth_using=False,
+            )
+        chosen = segments[segment - 1]
+        start, end, text = reader.slice(
+            target.file, chosen.start_line, chosen.end_line
+        )
+        piece = _Piece(
+            symbol=target,
+            file=target.file,
+            start_line=start,
+            end_line=end,
+            kind=target.kind,
+            label=label,
+            full=False,
+            text=text,
+            tokens=tokens.estimate(text),
+        )
+
+    total = piece.tokens
+    worth = tokens.worth_using(total, baseline)
+    note = _build_note(total, baseline, total, {}, 0, worth)
+    count = count or 1
+    return Pack(
+        target=_to_slice(piece),
+        token_total=total,
+        token_baseline=baseline,
+        savings_pct=tokens.savings_pct(total, baseline),
+        worth_using=worth,
+        note=f"segment {segment}/{count} of {label}; {note}",
+    )
+
+
 def pack(
     conn: sqlite3.Connection,
     root: Path,
@@ -598,13 +725,20 @@ def pack(
     budget_tokens: int = 30000,
     include_tests: bool = True,
     full_body: bool = True,
+    max_target_tokens: int = SEGMENT_THRESHOLD_TOKENS,
+    segment: int | None = None,
 ) -> Pack:
     """Pack the causal neighbourhood of ``file``:``name`` within a token budget.
 
-    Slices are read from disk. The target always keeps its full body; callers,
-    callees and imports start as signature slices and are expanded only when
-    the budget allows. When over budget, sections are trimmed in the order
-    tests, callers, callees, imports, and the counts land in ``note``.
+    Slices are read from disk. A target larger than ``max_target_tokens`` is
+    reduced to its signature plus an outline of contiguous ``segments``; the
+    caller can then fetch one block with ``segment=N`` or by line range. Small
+    targets keep their full body. Callers and callees start as signature slices
+    and are expanded only while the packed result stays under both the budget
+    ratio and the absolute expansion cap. Imports are never expanded.
+
+    When over budget, sections are trimmed in the order tests, callers, callees,
+    imports, and the counts land in ``note``.
     """
     rel = normalize_path(file)
     target = find_symbol(conn, rel, name) if name else _default_target(conn, rel)
@@ -614,6 +748,10 @@ def pack(
 
     reader = _Reader(Path(root))
     baseline = tokens.estimate(reader.text(rel))
+    lang = _file_lang(conn, rel)
+
+    if segment is not None:
+        return _pack_segment(target, reader, lang, segment, baseline)
 
     taken = {target.id}
     sections: dict[str, list[_Piece]] = {
@@ -649,6 +787,23 @@ def pack(
 
     target_piece = _full_piece(target, reader)
     budget = max(0, int(budget_tokens))
+    max_target = max(0, int(max_target_tokens))
+    threshold = min(max_target, budget) if budget > 0 else max_target
+
+    # Oversized targets become a signature plus an addressable outline. The
+    # outline keeps the result honest: the caller still sees what the symbol
+    # contains, but pays for the parts it actually needs.
+    split_segments = 0
+    if target_piece.tokens > threshold:
+        segments = _segment_target(target, reader, lang)
+        if segments:
+            outline = _signature_piece(target, reader)
+            outline.segments = segments
+            outline.truncated = True
+            outline.total_tokens = target_piece.tokens
+            target_piece = outline
+            split_segments = len(segments)
+
     total = target_piece.tokens + sum(
         piece.tokens for items in sections.values() for piece in items
     )
@@ -667,20 +822,32 @@ def pack(
     # small target with many callers expands into something several times more
     # expensive than the file it came from.
     cap = min(budget, int(baseline * PACK_CAP_RATIO)) if baseline > 0 else budget
+    expansion_cap = min(cap, PACK_EXPAND_CAP_TOKENS)
 
     upgraded = 0
-    if full_body and total < cap:
+    # A split target must not trigger expansion: the budget freed by the
+    # outline would otherwise be spent pasting every neighbour in full.
+    if full_body and not split_segments and total < cap:
         for key in _UPGRADE_ORDER:
             items = sections[key]
             for index, piece in enumerate(items):
-                if piece.full:
+                if piece.full or piece.symbol is None:
                     continue
                 expanded = _expand(piece, reader)
                 delta = expanded.tokens - piece.tokens
                 if delta <= 0:
                     items[index] = expanded
                     continue
-                if total + delta <= cap:
+                # Imports are not in _UPGRADE_ORDER, but if that ever changes,
+                # only a small definition may be pulled in -- never a whole
+                # file.
+                if key == "imports" and (
+                    expanded.end_line - expanded.start_line + 1
+                    > _IMPORT_EXPAND_MAX_LINES
+                    or expanded.tokens > _IMPORT_EXPAND_MAX_TOKENS
+                ):
+                    continue
+                if total + delta <= expansion_cap:
                     items[index] = expanded
                     total += delta
                     upgraded += 1
@@ -708,5 +875,13 @@ def pack(
         token_baseline=baseline,
         savings_pct=tokens.savings_pct(token_total, baseline),
         worth_using=worth,
-        note=_build_note(token_total, baseline, budget, trimmed, upgraded, worth),
+        note=_build_note(
+            token_total,
+            baseline,
+            budget,
+            trimmed,
+            upgraded,
+            worth,
+            split_segments,
+        ),
     )

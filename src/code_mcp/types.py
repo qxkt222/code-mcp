@@ -82,6 +82,21 @@ class Ref:
 
 
 @dataclass(slots=True)
+class Segment:
+    """One addressable block inside an oversized symbol.
+
+    ``index`` is 1-based and stable for a given source revision, so a caller can
+    ask for the same block again by index or by its line range.
+    """
+
+    index: int
+    start_line: int
+    end_line: int
+    tokens: int
+    label: str
+
+
+@dataclass(slots=True)
 class Slice:
     """A bounded piece of source text handed to the caller."""
 
@@ -92,8 +107,18 @@ class Slice:
     symbol: str = ""
     kind: str = SYMBOL_KINDS[0]
     tokens: int = 0
+    # Set only when the symbol was too large to return whole: ``text`` then
+    # holds the signature and ``segments`` describes what was left out.
+    segments: list[Segment] = field(default_factory=list)
+    truncated: bool = False
+    total_tokens: int = 0
 
     def header(self) -> str:
+        if self.truncated:
+            return (
+                f"{self.file}:{self.start_line}-{self.end_line} [{self.kind}] "
+                f"(outline, {len(self.segments)} segments, {self.total_tokens} tokens)"
+            )
         return f"{self.file}:{self.start_line}-{self.end_line} [{self.kind}]"
 
 

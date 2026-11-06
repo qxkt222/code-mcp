@@ -27,6 +27,8 @@ _TSX_PARSER = Parser(Language(tree_sitter_typescript.language_tsx()))
 
 _FUNCTION_VALUES = {"arrow_function", "function_expression", "function", "generator_function"}
 _CLASS_VALUES = {"class", "class_expression"}
+# Anonymous function forms create a variable scope but no symbol of their own.
+_SCOPE_ONLY_VALUES = {"arrow_function", "function_expression", "generator_function"}
 
 
 def parse_typescript(source: bytes, lang: str = "typescript") -> ParsedFile:
@@ -63,10 +65,20 @@ class _Walker:
         self.c = collector
         self.names: list[str] = []
         self.scopes: list[str] = []  # "class" | "interface" | "function"
+        # Qualname path of the innermost container (symbol or object literal
+        # key); used to name methods found inside object literals.
+        self.containers: list[str] = []
+        # Qualname of the innermost real symbol; calls and `new` expressions
+        # are credited to it so refs stay attached to store actions.
+        self.owners: list[str] = []
 
     @property
     def qualname(self) -> str:
         return ".".join(self.names)
+
+    @property
+    def ref_qualname(self) -> str:
+        return self.owners[-1] if self.owners else ""
 
     # ------------------------------------------------------------------ walk
 
@@ -104,6 +116,12 @@ class _Walker:
             return
         if kind == "method_signature":
             self._method_signature(node)
+            return
+        if kind in _SCOPE_ONLY_VALUES:
+            self._scope_only(node)
+            return
+        if kind == "pair":
+            self._pair(node)
             return
         if kind == "call_expression":
             self._call(node)
@@ -359,7 +377,15 @@ class _Walker:
                     for type_name in self._type_names(annotation):
                         self.c.add_ref("", type_name, REF_TYPE)
                 if value is not None:
-                    self.walk(value)
+                    # The const is a symbol: object-literal methods inside its
+                    # initializer are named ``<const>.<key>``.
+                    self.containers.append(name)
+                    self.owners.append(name)
+                    try:
+                        self.walk(value)
+                    finally:
+                        self.owners.pop()
+                        self.containers.pop()
             else:
                 self._walk_children(declarator)
 
@@ -477,15 +503,89 @@ class _Walker:
             self.walk(child)
         self._pop()
 
+    def _scope_only(self, node: Node) -> None:
+        """Walk an anonymous function body without giving it a name.
+
+        ``const`` declarations inside callbacks must not surface as
+        module-level constants, but the callback itself has no name to prefix
+        them with, so only ``scopes`` is pushed.
+        """
+        self.scopes.append("function")
+        try:
+            for child in node.children:
+                self.walk(child)
+        finally:
+            self.scopes.pop()
+
+    def _pair(self, node: Node) -> None:
+        """Index a function-valued object-literal member as a method.
+
+        Store actions (``create((set) => ({ sendMessage: ... }))``) become
+        addressable symbols. The span covers the whole ``pair`` so an edit can
+        replace the member in place; nested object literals contribute their
+        key to the qualname of deeper methods.
+        """
+        key = node.child_by_field_name("key")
+        value = node.child_by_field_name("value")
+        if key is None or value is None:
+            self._walk_children(node)
+            return
+        if key.type not in ("property_identifier", "identifier"):
+            self._walk_children(node)
+            return
+
+        name = _text(key)
+        parent = self.containers[-1] if self.containers else ""
+        qualname = f"{parent}.{name}" if parent else name
+
+        if value.type in _FUNCTION_VALUES:
+            body = value.child_by_field_name("body")
+            end = body.start_byte if body is not None else value.end_byte
+            signature = collapse_ws(self.c.snippet(node.start_byte, end))
+            signature = signature.rstrip("=>").rstrip()
+            self.c.add_symbol(
+                name=name,
+                qualname=qualname,
+                kind="method",
+                start_byte=node.start_byte,
+                end_byte=node.end_byte,
+                start_line=node_start_line(node),
+                end_line=node_end_line(node),
+                signature=signature,
+                docstring=self._leading_jsdoc(node),
+            )
+            self._type_refs(value, qualname)
+            self.containers.append(qualname)
+            self.owners.append(qualname)
+            try:
+                self.walk(value)
+            finally:
+                self.owners.pop()
+                self.containers.pop()
+            return
+
+        # A plain object value still contributes its key to the qualname of
+        # any methods nested one level deeper.
+        self.containers.append(qualname)
+        try:
+            self._walk_children(node)
+        finally:
+            self.containers.pop()
+
     # ---------------------------------------------------------------- helpers
 
     def _push(self, name: str, scope: str) -> None:
         self.names.append(name)
         self.scopes.append(scope)
+        qualname = ".".join(self.names)
+        self.containers.append(qualname)
+        self.owners.append(qualname)
 
     def _pop(self) -> None:
         self.names.pop()
         self.scopes.pop()
+        self.containers.pop()
+        self.owners.pop()
 
     def _walk_children(self, node: Node) -> None:
         for child in node.children:
@@ -610,9 +710,9 @@ class _Walker:
     def _call(self, node: Node) -> None:
         name = _callee_name(node.child_by_field_name("function"))
         if name:
-            self.c.add_ref(self.qualname, name, REF_CALL)
+            self.c.add_ref(self.ref_qualname, name, REF_CALL)
 
     def _new(self, node: Node) -> None:
         name = _callee_name(node.child_by_field_name("constructor"))
         if name:
-            self.c.add_ref(self.qualname, name, REF_TYPE)
+            self.c.add_ref(self.ref_qualname, name, REF_TYPE)

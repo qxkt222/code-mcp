@@ -243,6 +243,54 @@ def test_typescript_export_from() -> None:
     assert any(ref.to_name == "Gamma" and ref.kind == REF_IMPORT for ref in parsed.refs)
 
 
+def test_typescript_anonymous_functions_scope_local_constants() -> None:
+    parsed = parse_source(
+        b"const top = 1;\n"
+        b"it(() => { const in_arrow = 2; });\n"
+        b"const fn = function () { const in_function = 3; };\n",
+        "typescript",
+    )
+
+    qualnames = {symbol.qualname for symbol in parsed.symbols}
+    assert qualnames == {"top", "fn"}
+    assert not any(symbol.name.startswith("in_") for symbol in parsed.symbols)
+
+
+def test_typescript_object_arrow_members_become_methods() -> None:
+    source = (
+        b"export const useStore = create<TavernState>((set) => ({\n"
+        b"  sendMessage: async (text: string): Promise<void> => { set(text); },\n"
+        b"  ui: {\n"
+        b"    toggle: () => {},\n"
+        b"  },\n"
+        b"  plain: 1,\n"
+        b"}));\n"
+    )
+    parsed = parse_source(source, "typescript")
+    symbols = _by_qual(parsed)
+
+    assert symbols["useStore.sendMessage"].kind == "method"
+    assert symbols["useStore.ui.toggle"].kind == "method"
+    assert "useStore.plain" not in symbols
+
+    # The symbol span covers the whole pair so it can be replaced in place.
+    member = symbols["useStore.sendMessage"]
+    raw = source[member.start_byte : member.end_byte]
+    assert raw.startswith(b"sendMessage:")
+    assert raw.endswith(b"}")
+
+    refs = {(ref.from_qualname, ref.to_name, ref.kind) for ref in parsed.refs}
+    assert ("useStore.sendMessage", "set", REF_CALL) in refs
+
+
+def test_typescript_object_arrow_member_without_outer_symbol() -> None:
+    parsed = parse_source(b"create((set) => ({ foo: () => {} }));\n", "typescript")
+
+    assert [symbol.qualname for symbol in parsed.symbols] == ["foo"]
+    assert parsed.symbols[0].kind == "method"
+    assert parsed.symbols[0].signature == "foo: ()"
+
+
 def test_rust_symbols_docstrings_and_attributes() -> None:
     parsed = parse_source(RUST_SOURCE, "rust")
     symbols = _by_qual(parsed)

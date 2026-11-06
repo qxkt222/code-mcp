@@ -12,12 +12,15 @@ from .graph.impact import impact as compute_impact
 from .graph.refs import find_symbol, resolve_refs
 from .graph.tauri import build_bridges
 from .index.builder import build_index
+from .index.modules import resolve_imports
 from .index.search import search_comments, search_symbols
 from .config import load_config
 from .pack import pack as build_pack
+from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
 from .review.structural import analyze as analyze_structure
+from .serialize import pack_dict
 from .edit import replace_symbol
 from . import tokens as token_util
 
@@ -39,6 +42,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     root, conn = _open(args.path)
     try:
         stats = build_index(root, conn, load_config(root), force=args.force)
+        resolve_imports(conn, root)
         resolve_refs(conn)
         build_bridges(conn)
         conn.commit()
@@ -93,25 +97,37 @@ def cmd_find(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def _print_slice(label: str, item) -> None:
+    """Print one packed slice; an oversized target is shown as its outline."""
+    print(f"\n=== {label} {item.header()} ===")
+    if item.truncated:
+        for segment in item.segments:
+            print(
+                f"  #{segment.index}  L{segment.start_line}-{segment.end_line}  "
+                f"{segment.label}"
+            )
+        return
+    print(item.text)
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
     root, conn = _open(args.path)
     try:
-        result = build_pack(conn, root, args.file, args.name, budget_tokens=args.budget)
+        result = build_pack(
+            conn,
+            root,
+            args.file,
+            args.name,
+            budget_tokens=args.budget,
+            max_target_tokens=args.max_target_tokens,
+            segment=args.segment,
+        )
         if args.json:
-            _print_json(
-                {
-                    "tokens_used": result.token_total,
-                    "tokens_if_read_file": result.token_baseline,
-                    "savings_pct": result.savings_pct,
-                    "worth_using": result.worth_using,
-                    "note": result.note,
-                }
-            )
+            _print_json(pack_dict(result))
             return 0
         for label, items in result.sections().items():
             for item in items:
-                print(f"\n=== {label} {item.header()} ===")
-                print(item.text)
+                _print_slice(label, item)
         print(
             f"\n[pack] {result.token_total} tokens vs {result.token_baseline} "
             f"for a plain read ({result.savings_pct}% saved)"
@@ -126,7 +142,13 @@ def cmd_pack(args: argparse.Namespace) -> int:
 def cmd_slice(args: argparse.Namespace) -> int:
     root, conn = _open(args.path)
     try:
-        source = root / args.file
+        source = resolve_within(root, args.file)
+        if source is None:
+            print("file is outside the repository root", file=sys.stderr)
+            return 1
+        if not source.is_file():
+            print(f"not a file: {args.file}", file=sys.stderr)
+            return 1
         lines = source.read_bytes().decode("utf-8", errors="replace").splitlines()
         if args.name:
             symbol = find_symbol(conn, args.file, args.name)
@@ -137,14 +159,18 @@ def cmd_slice(args: argparse.Namespace) -> int:
         else:
             first, last = args.start, args.end or args.start
         text = "\n".join(lines[first - 1 : last])
+        tokens = token_util.estimate(text)
         if args.json:
             _print_json(
                 {
                     "file": args.file,
                     "start_line": first,
                     "end_line": last,
-                    "tokens": token_util.estimate(text),
+                    "tokens": tokens,
                     "text": text,
+                    "segments": [],
+                    "truncated": False,
+                    "total_tokens": tokens,
                 }
             )
         else:
@@ -301,6 +327,19 @@ def build_parser() -> argparse.ArgumentParser:
     pack_parser.add_argument("file")
     pack_parser.add_argument("name", nargs="?", default=None)
     pack_parser.add_argument("-b", "--budget", type=int, default=30000, dest="budget")
+    pack_parser.add_argument(
+        "--segment",
+        type=int,
+        default=None,
+        help="fetch one outline block by 1-based index",
+    )
+    pack_parser.add_argument(
+        "--max-target-tokens",
+        type=int,
+        default=4000,
+        dest="max_target_tokens",
+        help="target size above which an outline is returned (default: 4000)",
+    )
     pack_parser.set_defaults(func=cmd_pack)
 
     slice_parser = shared("slice", "read one symbol or a line range")

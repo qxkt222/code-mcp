@@ -6,7 +6,7 @@ import sqlite3
 
 from code_mcp import db, tokens
 from code_mcp.graph.refs import resolve_refs
-from code_mcp.pack import pack
+from code_mcp.pack import PACK_EXPAND_CAP_TOKENS, pack
 from code_mcp.types import CONF_NAME, REF_CALL
 
 SERVICE = '''"""Service helpers."""
@@ -98,6 +98,48 @@ def _ref(conn: sqlite3.Connection, from_id: int, to_name: str) -> None:
     )
 
 
+def _line_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line.encode("utf-8")))
+    return offsets
+
+
+def _symbol_span(
+    conn: sqlite3.Connection,
+    file_id: int,
+    text: str,
+    name: str,
+    start_line: int,
+    end_line: int,
+    signature: str = "",
+    docstring: str = "",
+    kind: str = "function",
+) -> int:
+    """Insert a symbol with byte offsets derived from the real file text."""
+    offsets = _line_offsets(text)
+    start_byte = offsets[min(start_line - 1, len(offsets) - 1)]
+    end_byte = offsets[min(end_line, len(offsets) - 1)]
+    cursor = conn.execute(
+        """INSERT INTO symbols(file_id, name, qualname, kind, start_line, end_line,
+                               start_byte, end_byte, signature, docstring)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            file_id,
+            name,
+            name,
+            kind,
+            start_line,
+            end_line,
+            start_byte,
+            end_byte,
+            signature,
+            docstring,
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
 def _fixture(tmp_path) -> tuple[sqlite3.Connection, dict[str, int]]:
     (tmp_path / "app").mkdir()
     (tmp_path / "tests").mkdir()
@@ -139,12 +181,15 @@ def _fixture(tmp_path) -> tuple[sqlite3.Connection, dict[str, int]]:
     ):
         _ref(conn, ids[from_name], to_name)
 
+    # ``resolved_file_id`` is what a real index stores after resolving module
+    # paths; refs may only cross files along these edges.
     conn.executemany(
-        "INSERT INTO imports(file_id, module, alias, resolved_file_id) VALUES (?, ?, ?, NULL)",
+        "INSERT INTO imports(file_id, module, alias, resolved_file_id) VALUES (?, ?, ?, ?)",
         [
-            (service, "app.util", "parse"),
-            (service, "app.util", "format_value"),
-            (view, "app.service", "load"),
+            (service, "app.util", "parse", util),
+            (service, "app.util", "format_value", util),
+            (view, "app.service", "load", service),
+            (tests, "app.service", "load", service),
         ],
     )
     conn.commit()
@@ -248,7 +293,8 @@ def test_pack_expands_neighbours_when_budget_allows(tmp_path):
 
     assert "return load(path)" in packed.callers[0].text
     assert "return value.strip()" in packed.callees[0].text
-    assert "return f\"[{value}]\"" in packed.imports[0].text
+    # Imports are never expanded to a full body, even with a huge budget.
+    assert "return f\"[{value}]\"" not in packed.imports[0].text
 
 
 def test_pack_token_accounting_matches_slices(tmp_path):
@@ -397,3 +443,240 @@ def test_pack_normalises_crlf_line_endings(tmp_path):
     assert "\r" not in packed.target.text
     # The baseline still reflects the real bytes on disk.
     assert packed.token_baseline == tokens.estimate(raw)
+
+
+# --------------------------------------------------------------------------- #
+# Oversized targets (outline + segments)
+# --------------------------------------------------------------------------- #
+
+
+def _big_source(statements: int = 1200, callers: int = 0) -> str:
+    lines = ["def big():", '    """Big."""', "    total = 0"]
+    lines += [f"    total += {index}" for index in range(statements)]
+    lines += ["    return total", ""]
+    for index in range(callers):
+        lines += ["", f"def caller{index}():", f"    value = {index}"]
+        lines += [f"    value += {step}" for step in range(300)]
+        lines += ["    return big()", ""]
+    return "\n".join(lines) + "\n"
+
+
+def _write(conn, root, path: str, text: str, lang: str = "python") -> int:
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8", newline="\n")
+    return _file(conn, path, text, lang)
+
+
+def _big_fixture(tmp_path, statements: int = 1200, callers: int = 0):
+    source = _big_source(statements, callers)
+    conn = _db(tmp_path)
+    file_id = _write(conn, tmp_path, "big.py", source)
+    line_count = len(source.splitlines())
+    big_end = 3 + statements + 1
+    _symbol_span(conn, file_id, source, "big", 1, big_end, "def big()", "Big.")
+    caller_names: list[str] = []
+    if callers:
+        lines = source.splitlines()
+        for index in range(callers):
+            start = next(
+                line_no
+                for line_no, line in enumerate(lines, start=1)
+                if line.startswith(f"def caller{index}()")
+            )
+            name = f"caller{index}"
+            caller_id = _symbol_span(
+                conn, file_id, source, name, start, line_count, f"def {name}()"
+            )
+            _ref(conn, caller_id, "big")
+            caller_names.append(name)
+    conn.commit()
+    resolve_refs(conn)
+    return conn, source, caller_names
+
+
+def test_pack_outlines_an_oversized_target(tmp_path):
+    conn, source, _ = _big_fixture(tmp_path)
+
+    packed = pack(conn, tmp_path, "big.py", "big")
+
+    assert packed.target is not None
+    assert packed.target.truncated is True
+    assert len(packed.target.segments) >= 2
+    full_text = source.rstrip("\n")
+    assert packed.target.total_tokens == tokens.estimate(full_text)
+    assert packed.target.tokens < packed.target.total_tokens
+    assert "def big()" in packed.target.text
+    assert "total += 500" not in packed.target.text
+    assert "target split into" in packed.note
+    assert "fetch one with slice(file, start_line, end_line)" in packed.note
+
+
+def test_pack_returns_an_outline_when_budget_is_small(tmp_path):
+    conn, _, _ = _big_fixture(tmp_path)
+
+    packed = pack(conn, tmp_path, "big.py", "big", budget_tokens=100)
+
+    assert packed.target is not None
+    assert packed.target.truncated is True
+    assert packed.target.text.count("\n") < 5  # signature, not the body
+    assert "total += 500" not in packed.target.text
+    assert packed.token_total < 200
+
+
+def test_pack_segment_returns_the_requested_block(tmp_path):
+    conn, source, _ = _big_fixture(tmp_path)
+    outline = pack(conn, tmp_path, "big.py", "big")
+    assert outline.target is not None
+    last_index = len(outline.target.segments)
+    chosen = outline.target.segments[-1]
+
+    packed = pack(conn, tmp_path, "big.py", "big", segment=last_index)
+
+    assert packed.target is not None
+    assert (packed.target.start_line, packed.target.end_line) == (
+        chosen.start_line,
+        chosen.end_line,
+    )
+    lines = source.splitlines()
+    assert packed.target.text == "\n".join(
+        lines[chosen.start_line - 1 : chosen.end_line]
+    )
+    assert "return total" in packed.target.text
+    assert packed.target.truncated is False
+
+
+def test_pack_segment_out_of_range_is_reported(tmp_path):
+    conn, _, _ = _big_fixture(tmp_path)
+
+    packed = pack(conn, tmp_path, "big.py", "big", segment=99)
+
+    assert packed.target is None
+    assert packed.worth_using is False
+    assert "out of range" in packed.note
+
+
+def test_pack_does_not_segment_a_small_target(tmp_path):
+    conn, _ids = _fixture(tmp_path)
+
+    packed = pack(conn, tmp_path, "app/service.py", "load")
+
+    assert packed.target is not None
+    assert packed.target.truncated is False
+    assert packed.target.segments == []
+    assert "target split into" not in packed.note
+
+
+def test_split_target_skips_neighbour_expansion(tmp_path):
+    conn, _, callers = _big_fixture(tmp_path, callers=1)
+
+    packed = pack(conn, tmp_path, "big.py", "big", budget_tokens=10**6)
+
+    assert packed.target is not None and packed.target.truncated is True
+    assert [item.symbol for item in packed.callers] == callers
+    # The budget freed by the outline must not pull in the caller's body.
+    assert "return big()" not in packed.callers[0].text
+    assert "expanded" not in packed.note
+
+
+def _cap_source() -> str:
+    lines = ["def target():", "    return 1", ""]
+    for index in range(3):
+        lines += ["", f"def caller{index}():", f"    value = {index}"]
+        lines += [f"    value += {step}" for step in range(400)]
+        lines += ["    return target()", ""]
+    lines += ["# padding " + "x" * 40 for _ in range(1500)]
+    return "\n".join(lines) + "\n"
+
+
+def test_neighbour_expansion_has_an_absolute_cap(tmp_path):
+    source = _cap_source()
+    conn = _db(tmp_path)
+    file_id = _write(conn, tmp_path, "cap.py", source)
+    lines = source.splitlines()
+    target_id = _symbol_span(conn, file_id, source, "target", 1, 2, "def target()")
+    for index in range(3):
+        start = next(
+            line_no
+            for line_no, line in enumerate(lines, start=1)
+            if line.startswith(f"def caller{index}()")
+        )
+        caller_id = _symbol_span(
+            conn, file_id, source, f"caller{index}", start, start + 402,
+            f"def caller{index}()",
+        )
+        _ref(conn, caller_id, "target")
+    conn.commit()
+    resolve_refs(conn)
+
+    packed = pack(conn, tmp_path, "cap.py", "target", budget_tokens=10**6)
+
+    assert packed.token_total <= PACK_EXPAND_CAP_TOKENS
+    assert any(
+        "return target()" not in item.text for item in packed.callers
+    ), "the cap must stop at least one caller from expanding"
+
+
+def test_import_without_a_matching_symbol_stays_a_header(tmp_path):
+    helpers = "".join(f"def helper_{index}():\n    return {index}\n\n" for index in range(100))
+    service = "from app.helpers import add\n\n\ndef run():\n    return add(1)\n"
+
+    conn = _db(tmp_path)
+    helpers_id = _write(conn, tmp_path, "app/helpers.py", helpers)
+    service_id = _write(conn, tmp_path, "app/service.py", service)
+    run_id = _symbol_span(
+        conn, service_id, service, "run", 4, 5, "def run()", kind="function"
+    )
+    conn.execute(
+        "INSERT INTO imports(file_id, module, alias, resolved_file_id) VALUES (?, ?, ?, ?)",
+        (service_id, "app.helpers", "add", helpers_id),
+    )
+    conn.commit()
+    resolve_refs(conn)
+
+    packed = pack(conn, tmp_path, "app/service.py", "run", budget_tokens=10**6)
+
+    assert [item.file for item in packed.imports] == ["app/helpers.py"]
+    assert packed.imports[0].end_line <= 15
+    assert "def helper_99" not in packed.imports[0].text
+
+
+# --------------------------------------------------------------------------- #
+# Test discovery prefilter
+# --------------------------------------------------------------------------- #
+
+
+def test_test_prefilter_keeps_multi_part_names(tmp_path):
+    target = "def fetch_user_data():\n    return 1\n"
+    tests = (
+        "def test_fetch_user_data():\n    pass\n\n\n"
+        "def fetch_user_data_test():\n    pass\n\n\n"
+        "def test_fetch_user_data_roundtrip():\n    pass\n\n\n"
+        "def test_data_fetch_user():\n    pass\n\n\n"
+        "def helper_fetch_user_data():\n    pass\n"
+    )
+
+    conn = _db(tmp_path)
+    target_file = _write(conn, tmp_path, "app/api.py", target)
+    _symbol_span(
+        conn, target_file, target, "fetch_user_data", 1, 2, "def fetch_user_data()"
+    )
+    tests_file = _write(conn, tmp_path, "tests/test_users.py", tests)
+    for name, start in (
+        ("test_fetch_user_data", 1),
+        ("fetch_user_data_test", 5),
+        ("test_fetch_user_data_roundtrip", 9),
+        ("test_data_fetch_user", 13),
+        ("helper_fetch_user_data", 17),
+    ):
+        _symbol_span(conn, tests_file, tests, name, start, start + 1, f"def {name}()")
+    conn.commit()
+
+    packed = pack(conn, tmp_path, "app/api.py", "fetch_user_data")
+
+    # Underscores are identifier characters here: only the exact variants and
+    # the "test_*" prefix form match, and the prefilter must not discard them.
+    assert {item.symbol for item in packed.tests} == {
+        "test_fetch_user_data",
+        "fetch_user_data_test",
+    }

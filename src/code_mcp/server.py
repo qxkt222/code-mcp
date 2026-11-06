@@ -19,12 +19,15 @@ from .graph.impact import impact as compute_impact
 from .graph.refs import find_symbol, resolve_refs
 from .graph.tauri import build_bridges
 from .index.builder import build_index
+from .index.modules import resolve_imports
 from .index.search import search_comments, search_symbols
 from .pack import pack as build_pack
+from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
 from .review.structural import analyze as analyze_structure
-from .types import Slice, Symbol
+from .serialize import pack_dict
+from .types import Symbol
 
 INSTRUCTIONS = (
     "Local code-context server. Use it before reading whole files: it returns only the "
@@ -62,33 +65,6 @@ def _symbol_dict(symbol: Symbol) -> dict:
     }
 
 
-def _slice_dict(slice_: Slice) -> dict:
-    return {
-        "file": slice_.file,
-        "symbol": slice_.symbol,
-        "kind": slice_.kind,
-        "start_line": slice_.start_line,
-        "end_line": slice_.end_line,
-        "tokens": slice_.tokens,
-        "text": slice_.text,
-    }
-
-
-def _pack_dict(pack) -> dict:
-    return {
-        "target": _slice_dict(pack.target) if pack.target else None,
-        "callers": [_slice_dict(item) for item in pack.callers],
-        "callees": [_slice_dict(item) for item in pack.callees],
-        "imports": [_slice_dict(item) for item in pack.imports],
-        "tests": [_slice_dict(item) for item in pack.tests],
-        "tokens_used": pack.token_total,
-        "tokens_if_read_file": pack.token_baseline,
-        "savings_pct": pack.savings_pct,
-        "worth_using": pack.worth_using,
-        "note": pack.note,
-    }
-
-
 # ----------------------------------------------------------------------------- tools
 
 
@@ -107,6 +83,7 @@ def index(path: str, force: bool = False) -> dict:
     conn = _conn(root)
     try:
         stats = build_index(root, conn, config, force=force)
+        resolve_imports(conn, root)
         resolve_refs(conn)
         build_bridges(conn)
         conn.commit()
@@ -162,6 +139,8 @@ def pack(
     name: str | None = None,
     budget_tokens: int = 30000,
     include_tests: bool = True,
+    segment: int | None = None,
+    max_target_tokens: int = 4000,
 ) -> dict:
     """Return the target symbol plus its causal neighbourhood, trimmed to a budget.
 
@@ -170,12 +149,21 @@ def pack(
     cost versus reading the containing file. If `worth_using` is false, read the
     file directly — the packed result would not save anything.
 
+    A target larger than `max_target_tokens` is reduced to its signature plus an
+    outline: `target.segments` lists the addressable blocks and `target.truncated`
+    is true. Fetch one block with `segment=N` (1-based) or with
+    `slice_symbol(start_line=..., end_line=...)`. A `segment` that is out of
+    range returns `worth_using=false` and an explanatory note.
+
     Args:
         path: Repository root directory.
         file: Repository-relative file path.
         name: Symbol name. Omit for the first top-level symbol in the file.
         budget_tokens: Upper bound on returned tokens, default 30000.
         include_tests: Include tests that reference the symbol.
+        segment: 1-based index of one outline block to fetch instead of the pack.
+        max_target_tokens: Target size above which an outline is returned,
+            default 4000.
     """
     root = _root(path)
     conn = _conn(root)
@@ -187,8 +175,10 @@ def pack(
             name,
             budget_tokens=budget_tokens,
             include_tests=include_tests,
+            max_target_tokens=max_target_tokens,
+            segment=segment,
         )
-        return _pack_dict(result)
+        return pack_dict(result)
     finally:
         conn.close()
 
@@ -216,7 +206,9 @@ def slice_symbol(
     root = _root(path)
     conn = _conn(root)
     try:
-        source_path = root / file
+        source_path = resolve_within(root, file)
+        if source_path is None:
+            raise ValueError("file is outside the repository root")
         if not source_path.is_file():
             raise ValueError(f"not a file: {file}")
 
