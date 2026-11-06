@@ -8,7 +8,7 @@ produced: the caller can hand the result straight to ``json.dump``.
 from __future__ import annotations
 
 from . import tokens
-from .types import Pack, Segment, Slice
+from .types import GateResult, Pack, Segment, Slice
 
 
 def segment_dict(segment: Segment) -> dict:
@@ -63,4 +63,29 @@ def pack_dict(pack: Pack) -> dict:
         "effective_savings_pct": effective,
         "worth_using": pack.worth_using,
         "note": pack.note,
+    }
+
+
+def gate_dict(result: GateResult, detected_config: bool | None = None) -> dict:
+    """JSON-ready form of a gate result, shared by the MCP tool and the CLI.
+
+    The shape matches ``server.gate``: ``passed``, ``detected_config`` and one
+    entry per step. ``detected_config`` comes from :class:`Config`, which is
+    not part of :class:`GateResult`, so callers pass ``config.detected``
+    explicitly; when omitted the key is ``None`` rather than a guess.
+    """
+    return {
+        "passed": result.passed,
+        "detected_config": detected_config,
+        "steps": [
+            {
+                "name": step.name,
+                "command": step.command,
+                "passed": step.passed,
+                "exit_code": step.exit_code,
+                "duration_s": round(step.duration_s, 2),
+                "output": step.output,
+            }
+            for step in result.steps
+        ],
     }

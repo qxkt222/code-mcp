@@ -18,7 +18,8 @@ from pathlib import Path
 from ..config import Config, GateStepSpec
 from ..types import GateResult, GateStep
 
-MAX_OUTPUT_CHARS = 4000
+MAX_OUTPUT_CHARS = 12000
+_TRUNCATION_MARKER = "\n...[truncated]...\n"
 _CMD_SUFFIXES = {".cmd", ".bat"}
 
 
@@ -97,7 +98,18 @@ def _decode(raw: bytes | str | None) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
-def _truncate(text: str) -> str:
-    if len(text) <= MAX_OUTPUT_CHARS:
+def _truncate(text: str, limit: int = MAX_OUTPUT_CHARS) -> str:
+    """Keep both ends of an oversized output.
+
+    Test runners and compilers report their failure summary at the end, while
+    the beginning still carries the command echo and the first errors, so the
+    head (one third) and the tail (two thirds) are preserved.
+    """
+    if len(text) <= limit:
         return text
-    return text[:MAX_OUTPUT_CHARS]
+    head = limit // 3
+    tail = limit - head - len(_TRUNCATION_MARKER)
+    if tail <= 0:
+        # Degenerate limit: keeping any tail would exceed the budget.
+        return text[:limit]
+    return text[:head] + _TRUNCATION_MARKER + text[-tail:]

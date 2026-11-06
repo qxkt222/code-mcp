@@ -121,6 +121,7 @@ def cmd_pack(args: argparse.Namespace) -> int:
             budget_tokens=args.budget,
             max_target_tokens=args.max_target_tokens,
             segment=args.segment,
+            force=args.force,
         )
         if args.json:
             _print_json(pack_dict(result))
@@ -219,7 +220,13 @@ def cmd_impact(args: argparse.Namespace) -> int:
         if symbol is None:
             print(f"symbol not found: {args.name}", file=sys.stderr)
             return 1
-        nodes = compute_impact(conn, symbol.id, depth=args.depth)
+        nodes = compute_impact(
+            conn,
+            symbol.id,
+            depth=args.depth,
+            include_tests=args.include_tests,
+            include_imports=args.include_imports,
+        )
         if args.json:
             _print_json(
                 {
@@ -230,9 +237,11 @@ def cmd_impact(args: argparse.Namespace) -> int:
                             "qualname": node.symbol.qualname,
                             "depth": node.depth,
                             "via": node.via,
+                            "line": node.line,
                         }
                         for node in nodes
                     ],
+                    "filtered": nodes.filtered,
                 }
             )
             return 0
@@ -286,11 +295,46 @@ def cmd_review(args: argparse.Namespace) -> int:
         conn.close()
 
 
+def _gate_payload(result, detected: bool) -> dict:
+    """JSON-ready gate result, shared with ``server.gate``.
+
+    ``serialize.gate_dict`` is the single source of truth when present; the
+    inline branch keeps the CLI working on its own.
+    """
+    try:
+        from .serialize import gate_dict
+    except ImportError:  # pragma: no cover - an older serialize without it
+        gate_dict = None
+    if gate_dict is not None:
+        try:
+            return gate_dict(result, detected_config=detected)
+        except TypeError:  # older signature without the optional argument
+            return gate_dict(result)
+    return {  # pragma: no cover - replaced by serialize.gate_dict
+        "passed": result.passed,
+        "detected_config": detected,
+        "steps": [
+            {
+                "name": step.name,
+                "command": step.command,
+                "passed": step.passed,
+                "exit_code": step.exit_code,
+                "duration_s": round(step.duration_s, 2),
+                "output": step.output,
+            }
+            for step in result.steps
+        ],
+    }
+
+
 def cmd_gate(args: argparse.Namespace) -> int:
     root = Path(args.path).expanduser().resolve()
     config = load_config(root)
     only = args.only.split(",") if args.only else None
     result = run_gate(config, only=only)
+    if args.json:
+        _print_json(_gate_payload(result, config.detected))
+        return 0 if result.passed else 1
     for step in result.steps:
         mark = "PASS" if step.passed else "FAIL"
         print(f"[{mark}] {step.name}: {step.command}  ({step.duration_s:.1f}s)")
@@ -346,6 +390,11 @@ def build_parser() -> argparse.ArgumentParser:
         dest="max_target_tokens",
         help="target size above which an outline is returned (default: 4000)",
     )
+    pack_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="return the pack even when it costs more than reading the file",
+    )
     pack_parser.set_defaults(func=cmd_pack)
 
     slice_parser = shared("slice", "read one symbol or a line range")
@@ -365,6 +414,16 @@ def build_parser() -> argparse.ArgumentParser:
     impact_parser.add_argument("file")
     impact_parser.add_argument("name")
     impact_parser.add_argument("-d", "--depth", type=int, default=2)
+    impact_parser.add_argument(
+        "--include-tests",
+        action="store_true",
+        help="also list callers that live in test files",
+    )
+    impact_parser.add_argument(
+        "--include-imports",
+        action="store_true",
+        help="also list import pseudo-symbols",
+    )
     impact_parser.set_defaults(func=cmd_impact)
 
     review_parser = shared("review", "run health and sustainability checks")

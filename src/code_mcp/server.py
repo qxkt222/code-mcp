@@ -141,6 +141,7 @@ def pack(
     include_tests: bool = True,
     segment: int | None = None,
     max_target_tokens: int = 4000,
+    force: bool = False,
 ) -> dict:
     """Return the target symbol plus its causal neighbourhood, trimmed to a budget.
 
@@ -164,6 +165,8 @@ def pack(
         segment: 1-based index of one outline block to fetch instead of the pack.
         max_target_tokens: Target size above which an outline is returned,
             default 4000.
+        force: return the packed context even when it costs more than reading the
+            file
     """
     root = _root(path)
     conn = _conn(root)
@@ -177,6 +180,7 @@ def pack(
             include_tests=include_tests,
             max_target_tokens=max_target_tokens,
             segment=segment,
+            force=force,
         )
         return pack_dict(result)
     finally:
@@ -282,10 +286,20 @@ def edit(
         conn.close()
 
 
-def impact(path: str, file: str, name: str, depth: int = 2, limit: int = 100) -> dict:
+def impact(
+    path: str,
+    file: str,
+    name: str,
+    depth: int = 2,
+    limit: int = 100,
+    include_tests: bool = False,
+    include_imports: bool = False,
+) -> dict:
     """List what breaks if this symbol changes, ranked by distance.
 
-    Use before changing a signature, renaming, or deleting a symbol.
+    Use before changing a signature, renaming, or deleting a symbol. Test
+    callers and import pseudo-symbols are hidden by default because they drown
+    out the actionable call sites; `filtered` reports how many were hidden.
 
     Args:
         path: Repository root directory.
@@ -293,6 +307,8 @@ def impact(path: str, file: str, name: str, depth: int = 2, limit: int = 100) ->
         name: Symbol name.
         depth: How many hops to follow, default 2.
         limit: Maximum affected symbols, default 100.
+        include_tests: Also list callers that live in test files.
+        include_imports: Also list import pseudo-symbols (empty qualnames).
     """
     root = _root(path)
     conn = _conn(root)
@@ -300,14 +316,27 @@ def impact(path: str, file: str, name: str, depth: int = 2, limit: int = 100) ->
         symbol = find_symbol(conn, file, name)
         if symbol is None:
             raise ValueError(f"symbol not found: {name} in {file}")
-        nodes = compute_impact(conn, symbol.id, depth=depth, limit=limit)
+        nodes = compute_impact(
+            conn,
+            symbol.id,
+            depth=depth,
+            limit=limit,
+            include_tests=include_tests,
+            include_imports=include_imports,
+        )
         return {
             "target": _symbol_dict(symbol),
             "affected": [
-                {**_symbol_dict(node.symbol), "depth": node.depth, "via": node.via}
+                {
+                    **_symbol_dict(node.symbol),
+                    "depth": node.depth,
+                    "via": node.via,
+                    "line": node.line,
+                }
                 for node in nodes
             ],
             "count": len(nodes),
+            "filtered": nodes.filtered,
         }
     finally:
         conn.close()

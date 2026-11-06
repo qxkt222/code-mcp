@@ -6,7 +6,9 @@ import sys
 from pathlib import Path
 
 from code_mcp.config import Config, GateStepSpec
-from code_mcp.review.gate import run_gate
+from code_mcp.review.gate import MAX_OUTPUT_CHARS, _truncate, run_gate
+from code_mcp.serialize import gate_dict
+from code_mcp.types import GateResult, GateStep
 
 
 def _python(expression: str) -> str:
@@ -68,13 +70,78 @@ def test_only_filter(tmp_path: Path) -> None:
     assert result.passed is True
 
 
-def test_output_is_truncated(tmp_path: Path) -> None:
-    config = _config(tmp_path, [GateStepSpec("noisy", _python("print('x' * 5000)"))])
+def test_output_is_truncated_keeping_both_ends(tmp_path: Path) -> None:
+    config = _config(
+        tmp_path,
+        [GateStepSpec("noisy", _python("print('HEAD' + 'x' * 20000 + 'TAIL')"))],
+    )
 
     result = run_gate(config)
 
+    output = result.steps[0].output
     assert result.steps[0].passed is True
-    assert len(result.steps[0].output) == 4000
+    assert len(output) == MAX_OUTPUT_CHARS
+    # The failure summary lives at the end, so the tail must survive.
+    assert output.startswith("HEAD")
+    assert output.rstrip().endswith("TAIL")
+    assert "...[truncated]..." in output
+
+
+def test_truncate_uses_one_third_head_and_rest_tail() -> None:
+    text = "a" * 1000 + "b" * 1000
+
+    output = _truncate(text, limit=300)
+
+    head, marker, tail = output.partition("\n...[truncated]...\n")
+    assert marker
+    assert len(output) == 300
+    assert head == "a" * 100
+    assert tail == "b" * (300 - 100 - len(marker))
+
+
+def test_short_output_is_untouched() -> None:
+    assert _truncate("small", limit=300) == "small"
+
+
+def test_gate_dict_matches_the_mcp_shape() -> None:
+    result = GateResult(
+        steps=[
+            GateStep(
+                name="tests",
+                command="python -m pytest -q",
+                exit_code=1,
+                duration_s=1.234,
+                output="boom",
+                passed=False,
+            )
+        ]
+    )
+
+    payload = gate_dict(result, detected_config=True)
+
+    assert payload == {
+        "passed": False,
+        "detected_config": True,
+        "steps": [
+            {
+                "name": "tests",
+                "command": "python -m pytest -q",
+                "passed": False,
+                "exit_code": 1,
+                "duration_s": 1.23,
+                "output": "boom",
+            }
+        ],
+    }
+
+
+def test_gate_dict_leaves_unknown_detection_as_none() -> None:
+    """``detected_config`` lives on Config, not GateResult: never guess it."""
+    assert gate_dict(GateResult()) == {
+        "passed": False,
+        "detected_config": None,
+        "steps": [],
+    }
 
 
 def test_timeout_is_isolated(tmp_path: Path) -> None:

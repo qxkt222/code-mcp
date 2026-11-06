@@ -8,9 +8,16 @@ from pathlib import Path
 
 from code_mcp import db, tokens
 from code_mcp.config import load_config
-from code_mcp.graph.refs import resolve_refs
+from code_mcp.graph.refs import find_symbol, resolve_refs
 from code_mcp.index.builder import _SIZES_META_KEY, build_index
-from code_mcp.pack import PACK_EXPAND_CAP_TOKENS, ensure_fresh, pack
+from code_mcp.pack import (
+    MIN_PACK_BASELINE_TOKENS,
+    PACK_EXPAND_CAP_TOKENS,
+    _Reader,
+    _signature_piece,
+    ensure_fresh,
+    pack,
+)
 from code_mcp.serialize import pack_dict
 from code_mcp.types import CONF_EXACT, CONF_NAME, REF_CALL
 
@@ -997,4 +1004,143 @@ def test_callers_and_callees_are_ranked_by_distance(tmp_path):
         "same_dir_callee",
         "same_pkg_callee",
         "remote_callee",
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# Forced packs
+# --------------------------------------------------------------------------- #
+
+
+def test_force_returns_a_payload_below_the_baseline_floor(tmp_path):
+    conn, _ids = _fixture(tmp_path)
+    assert tokens.estimate(UTIL) < MIN_PACK_BASELINE_TOKENS
+
+    packed = pack(conn, tmp_path, "app/util.py", "parse", force=True)
+
+    assert packed.target is not None
+    assert "def parse(value):" in packed.target.text
+    assert packed.token_baseline < MIN_PACK_BASELINE_TOKENS
+    assert packed.response_tokens > 0
+    assert packed.savings_pct == tokens.savings_pct(
+        packed.token_total, packed.token_baseline
+    )
+    assert packed.worth_using is False
+    assert packed.note.startswith("forced: ")
+    assert "read the file directly" in packed.note
+
+
+def test_force_returns_a_payload_the_envelope_would_withhold(tmp_path, monkeypatch):
+    conn, _ids = _fixture(tmp_path)
+    # Force the envelope to dominate while leaving the bodies untouched.
+    monkeypatch.setattr(tokens, "envelope_tokens", lambda slices: 10**6)
+
+    packed = pack(conn, tmp_path, "app/service.py", "load", budget_tokens=10**6, force=True)
+
+    assert packed.target is not None
+    assert "def load(path):" in packed.target.text
+    assert packed.response_tokens > packed.token_baseline
+    assert packed.savings_pct > 0  # the bodies alone are smaller than the file
+    assert packed.worth_using is False
+    assert packed.note.startswith("forced: ")
+    assert "not recommended" in packed.note
+
+
+def test_forced_segment_notes_that_it_was_forced(tmp_path):
+    conn, _ids = _fixture(tmp_path)
+
+    packed = pack(conn, tmp_path, "app/service.py", "load", segment=1, force=True)
+
+    assert packed.target is not None
+    assert packed.note.startswith("forced: ")
+
+
+# --------------------------------------------------------------------------- #
+# Clipped signatures (arrow-function constants)
+# --------------------------------------------------------------------------- #
+
+# Ten-line arrow-function head whose indexed signature is clipped at 200 chars:
+# the collapsed head ends with ``merge?: (left:...``, so exact substring
+# matching cannot find the declaration end. The body is closed by ``};``, the
+# point an unordered brace check used to swallow it into the signature slice.
+_ARROW_HEAD_END = 10
+_ARROW_BODY_END = 16
+
+_ARROW_SOURCE = '''export const pick = <
+  T extends Record<string, unknown>,
+  K extends keyof T,
+  R extends Partial<Pick<T, K>>,
+  S extends Record<K, unknown> = Record<K, unknown>,
+>(
+  source: T,
+  keys: K[],
+  merge?: (left: R, right: R) => R,
+): R => {
+  const result = {} as R
+  for (const key of keys) {
+    result[key] = source[key]
+  }
+  return result
+};
+
+export const other = 1;
+
+''' + "\n".join(f"// padding line {index}" for index in range(1, 121)) + "\n"
+
+
+def test_clipped_arrow_signature_stops_at_the_head(tmp_path):
+    conn, _target = _built_index(
+        tmp_path, "src/stores/useSimulationStore.ts", _ARROW_SOURCE
+    )
+    symbol = find_symbol(conn, "src/stores/useSimulationStore.ts", "pick")
+    assert symbol is not None
+    assert symbol.signature.endswith("...")  # the index clips the long head
+
+    assert symbol.end_line == _ARROW_BODY_END
+    piece = _signature_piece(symbol, _Reader(tmp_path))
+
+    assert piece.start_line == 1
+    assert piece.end_line == _ARROW_HEAD_END
+    assert piece.text.rstrip().endswith("): R => {")
+    # The arrow body must never be swallowed into the signature slice.
+    assert "const result = {} as R" not in piece.text
+    assert "return result" not in piece.text
+    assert "export const other" not in piece.text
+
+
+# --------------------------------------------------------------------------- #
+# CLI gate --json
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_gate_json_matches_the_server_shape():
+    from code_mcp import cli
+    from code_mcp.types import GateResult, GateStep
+
+    result = GateResult(
+        steps=[
+            GateStep(
+                name="unit",
+                command="pytest -q",
+                exit_code=0,
+                duration_s=1.234,
+                output="ok",
+                passed=True,
+            )
+        ]
+    )
+
+    payload = cli._gate_payload(result, detected=True)
+
+    assert payload["passed"] is True
+    assert payload["detected_config"] is True
+    assert payload["steps"] == [
+        {
+            "name": "unit",
+            "command": "pytest -q",
+            "passed": True,
+            "exit_code": 0,
+            "duration_s": 1.23,
+            "output": "ok",
+        }
     ]

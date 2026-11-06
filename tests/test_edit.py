@@ -462,6 +462,206 @@ def test_replace_symbol_rejects_symlink_escape(tmp_path: Path) -> None:
     assert "outside the repository root" in result.reason
 
 
+def _add_import(root: Path, rel: str, module: str, alias: str) -> None:
+    conn = db.open_index(root)
+    try:
+        row = conn.execute("SELECT id FROM files WHERE path = ?", (rel,)).fetchone()
+        assert row is not None
+        conn.execute(
+            "INSERT INTO imports(file_id, module, alias, resolved_file_id) "
+            "VALUES (?, ?, ?, NULL)",
+            (int(row["id"]), module, alias),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+CLASS_SOURCE = b"class Box:\n    def put(self, x):\n        return x\n"
+
+
+def test_class_method_accepts_slice_text_verbatim(tmp_path: Path) -> None:
+    """B1: the exact text returned by ``slice`` must be a legal ``edit`` input."""
+    _index(
+        tmp_path,
+        "pkg/box.py",
+        CLASS_SOURCE,
+        [("put", "Box.put", "method", "def put", "return x")],
+    )
+    # ``slice`` returns every line with the indentation it has in the file.
+    slice_text = "    def put(self, x):\n        return x\n"
+
+    result = replace_symbol(tmp_path, "pkg/box.py", "Box.put", slice_text)
+
+    assert result.applied is True, result.reason
+    assert (tmp_path / "pkg/box.py").read_bytes() == CLASS_SOURCE
+
+
+def test_class_method_slice_text_with_change_applies(tmp_path: Path) -> None:
+    _index(
+        tmp_path,
+        "pkg/box.py",
+        CLASS_SOURCE,
+        [("put", "Box.put", "method", "def put", "return x")],
+    )
+    new_code = "    def put(self, x):\n        return x + 1\n"
+
+    result = replace_symbol(tmp_path, "pkg/box.py", "Box.put", new_code)
+
+    assert result.applied is True, result.reason
+    assert (tmp_path / "pkg/box.py").read_bytes() == CLASS_SOURCE.replace(
+        b"return x", b"return x + 1"
+    )
+
+
+def test_class_method_with_mismatched_indent_is_rejected(tmp_path: Path) -> None:
+    _index(
+        tmp_path,
+        "pkg/box.py",
+        CLASS_SOURCE,
+        [("put", "Box.put", "method", "def put", "return x")],
+    )
+    before = (tmp_path / "pkg/box.py").read_bytes()
+
+    result = replace_symbol(
+        tmp_path,
+        "pkg/box.py",
+        "Box.put",
+        "        def put(self, x):\n            return x + 1\n",
+    )
+
+    assert result.applied is False
+    assert (tmp_path / "pkg/box.py").read_bytes() == before
+
+
+PY_CONST_SOURCE = b'MAX_SIZE = 10\nSHIPPING = "flat"\n\n\ndef keep():\n    return 1\n'
+
+
+def test_python_module_constant_edit_replaces_assignment(tmp_path: Path) -> None:
+    """B2: a module-level constant is an editable definition, not a missing name."""
+    _index(
+        tmp_path,
+        "pkg/const.py",
+        PY_CONST_SOURCE,
+        [("MAX_SIZE", "MAX_SIZE", "constant", "MAX_SIZE = 10", "MAX_SIZE = 10")],
+    )
+
+    result = replace_symbol(tmp_path, "pkg/const.py", "MAX_SIZE", "MAX_SIZE = 20\n")
+
+    assert result.applied is True, result.reason
+    written = (tmp_path / "pkg/const.py").read_bytes()
+    assert written.startswith(b"MAX_SIZE = 20\n")
+    assert b"SHIPPING = \"flat\"" in written
+
+
+def test_python_class_constant_accepts_slice_indent(tmp_path: Path) -> None:
+    source = b"class Store:\n    LIMIT = 10\n\n    def get(self):\n        return self.LIMIT\n"
+    _index(
+        tmp_path,
+        "pkg/store.py",
+        source,
+        [("LIMIT", "Store.LIMIT", "constant", "LIMIT = 10", "LIMIT = 10")],
+    )
+
+    result = replace_symbol(tmp_path, "pkg/store.py", "Store.LIMIT", "    LIMIT = 20\n")
+
+    assert result.applied is True, result.reason
+    assert b"\n    LIMIT = 20\n" in (tmp_path / "pkg/store.py").read_bytes()
+
+
+def test_python_non_editable_constant_reports_kind(tmp_path: Path) -> None:
+    """A symbol whose node type is not editable must not be reported as missing."""
+    source = b"COUNT += 1\n"
+    _index(
+        tmp_path,
+        "pkg/odd.py",
+        source,
+        [("COUNT", "COUNT", "constant", "COUNT += 1", "COUNT += 1")],
+    )
+    before = (tmp_path / "pkg/odd.py").read_bytes()
+
+    result = replace_symbol(tmp_path, "pkg/odd.py", "COUNT", "COUNT = 2\n")
+
+    assert result.applied is False
+    assert "is a constant" in result.reason
+    assert "editable" in result.reason
+    assert "no longer defined" not in result.reason
+    assert (tmp_path / "pkg/odd.py").read_bytes() == before
+
+
+TS_CONST_SOURCE = b"export const MAX = 10;\n\nconst OTHER = 1;\n"
+
+
+def test_typescript_const_replaces_whole_declaration(tmp_path: Path) -> None:
+    """B2: the indexed declarator span is widened so ``const`` is not duplicated."""
+    _index(
+        tmp_path,
+        "src/const.ts",
+        TS_CONST_SOURCE,
+        [("MAX", "MAX", "constant", "MAX = 10", "MAX = 10")],
+    )
+
+    result = replace_symbol(tmp_path, "src/const.ts", "MAX", "const MAX = 20;")
+
+    assert result.applied is True, result.reason
+    assert (tmp_path / "src/const.ts").read_bytes() == (
+        b"export const MAX = 20;\n\nconst OTHER = 1;\n"
+    )
+
+
+def test_typescript_multi_declarator_const_keeps_siblings(tmp_path: Path) -> None:
+    source = b"const A = 1, B = 2;\n"
+    _index(
+        tmp_path,
+        "src/multi.ts",
+        source,
+        [("A", "A", "constant", "A = 1", "A = 1")],
+    )
+
+    result = replace_symbol(tmp_path, "src/multi.ts", "A", "A = 5")
+
+    assert result.applied is True, result.reason
+    assert (tmp_path / "src/multi.ts").read_bytes() == b"const A = 5, B = 2;\n"
+
+
+def test_rust_const_edit_applies(tmp_path: Path) -> None:
+    source = b"pub const MAX: u32 = 10;\n\npub fn keep() -> u32 {\n    1\n}\n"
+    _index(
+        tmp_path,
+        "src/consts.rs",
+        source,
+        [("MAX", "MAX", "constant", "pub const MAX: u32 = 10;", "pub const MAX: u32 = 10;")],
+    )
+
+    result = replace_symbol(tmp_path, "src/consts.rs", "MAX", "pub const MAX: u32 = 20;")
+
+    assert result.applied is True, result.reason
+    assert (tmp_path / "src/consts.rs").read_bytes().startswith(b"pub const MAX: u32 = 20;\n")
+
+
+IMPORT_SOURCE = b'from decimal import Decimal\n\n\ndef use():\n    return Decimal("1")\n'
+
+
+def test_python_import_statement_edit(tmp_path: Path) -> None:
+    """B2: an import is editable and only its own statement is replaced."""
+    _index(
+        tmp_path,
+        "pkg/imp.py",
+        IMPORT_SOURCE,
+        [("use", "use", "function", "def use", 'return Decimal("1")')],
+    )
+    _add_import(tmp_path, "pkg/imp.py", "decimal", "Decimal")
+
+    result = replace_symbol(
+        tmp_path, "pkg/imp.py", "Decimal", "from decimal import Decimal as Dec\n"
+    )
+
+    assert result.applied is True, result.reason
+    assert (tmp_path / "pkg/imp.py").read_bytes() == (
+        b'from decimal import Decimal as Dec\n\n\ndef use():\n    return Decimal("1")\n'
+    )
+
+
 def test_resolve_within_covers_escape_cases(tmp_path: Path) -> None:
     root = tmp_path / "repo"
     root.mkdir()

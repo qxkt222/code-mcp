@@ -163,11 +163,12 @@ def _full_piece(symbol: Symbol, reader: _Reader) -> _Piece:
 
 
 def _declaration_end(symbol: Symbol, lines: list[str]) -> int:
-    """Last line of the declaration, located by matching the stored signature.
+    """Last line of the declaration head, located by matching the signature.
 
     Indexed signatures are whitespace-collapsed, so a multi-line ``def`` cannot
     be sliced by line count; the collapsed text is matched against the real
-    lines instead.
+    lines instead. A signature clipped to ``...`` is only the prefix of the real
+    text, so the exact end still comes from bracket balancing.
     """
     start = max(1, symbol.start_line)
     if start > len(lines):
@@ -179,28 +180,39 @@ def _declaration_end(symbol: Symbol, lines: list[str]) -> int:
     if not signature:
         return start
 
+    clipped = signature.endswith("...")
+    needle = signature[:-3].rstrip() if clipped else signature
+    if not needle:
+        needle = signature
+
     limit = min(ceiling, start + 39)
     accumulated: list[str] = []
     for line_no in range(start, limit + 1):
         accumulated.append(lines[line_no - 1])
-        if signature in " ".join(" ".join(accumulated).split()):
+        collapsed = " ".join(" ".join(accumulated).split())
+        if clipped:
+            # The clipped signature covers only the start of the declaration
+            # head; the end of the head is still found by bracket balance.
+            if len(collapsed) >= len(needle) and collapsed.startswith(needle):
+                break
+        elif signature in collapsed:
             return line_no
 
     # Fallback: stop once brackets balance and the declaration terminates.
     depth = 0
     for line_no in range(start, limit + 1):
         line = lines[line_no - 1]
-        for char in line:
+        stripped = line.rstrip()
+        for index, char in enumerate(line):
+            # A ``{`` that ends the line opens the body: the head ends here even
+            # though the brace raises the depth, so test it before counting.
+            if char == "{" and depth == 0 and not line[index + 1 :].strip():
+                return line_no
             if char in "([{":
                 depth += 1
             elif char in ")]}":
                 depth = max(0, depth - 1)
-        stripped = line.rstrip()
-        if depth == 0 and (
-            stripped.endswith(":")
-            or stripped.endswith(";")
-            or stripped.endswith("{")
-        ):
+        if depth == 0 and (stripped.endswith(":") or stripped.endswith(";")):
             return line_no
     return start
 
@@ -821,6 +833,7 @@ def pack(
     full_body: bool = True,
     max_target_tokens: int = SEGMENT_THRESHOLD_TOKENS,
     segment: int | None = None,
+    force: bool = False,
 ) -> Pack:
     """Pack the causal neighbourhood of ``file``:``name`` within a token budget.
 
@@ -833,6 +846,11 @@ def pack(
 
     When over budget, sections are trimmed in the order tests, callers, callees,
     imports, and the counts land in ``note``.
+
+    ``force=True`` skips the two refusals (tiny-file floor and response costing
+    more than a plain read), returning the payload anyway. The usual savings
+    fields are still filled in and ``note`` is prefixed with ``forced: `` so the
+    caller can judge the cost itself.
     """
     rel = normalize_path(file)
     # Offsets in the index are only meaningful while the file still matches
@@ -852,8 +870,9 @@ def pack(
     baseline = tokens.estimate(reader.text(rel))
 
     # A tiny file can never pay for the response envelope, however small the
-    # target is: reading the file directly is always the better move.
-    if baseline < MIN_PACK_BASELINE_TOKENS:
+    # target is: reading the file directly is always the better move. A forced
+    # call still returns the payload, with the cost stated in the note.
+    if baseline < MIN_PACK_BASELINE_TOKENS and not force:
         return Pack(
             token_baseline=baseline,
             worth_using=False,
@@ -863,7 +882,10 @@ def pack(
     lang = _file_lang(conn, rel)
 
     if segment is not None:
-        return _pack_segment(target, reader, lang, segment, baseline)
+        result = _pack_segment(target, reader, lang, segment, baseline)
+        if force and result.target is not None:
+            result.note = f"forced: {result.note}"
+        return result
 
     taken = {target.id}
     sections: dict[str, list[_Piece]] = {
@@ -995,8 +1017,9 @@ def pack(
     )
     # A response that costs more than a plain read is never worth sending, even
     # when it is only marginally over: the caller would pay for the very tokens
-    # this tool exists to save. Return the advice instead of the payload.
-    if baseline > 0 and response_tokens >= baseline:
+    # this tool exists to save. Return the advice instead of the payload. A
+    # forced call returns it anyway and reports the cost in the note.
+    if baseline > 0 and response_tokens >= baseline and not force:
         return Pack(
             response_tokens=response_tokens,
             token_baseline=baseline,
@@ -1009,6 +1032,18 @@ def pack(
         )
 
     worth = tokens.worth_using(response_tokens, baseline)
+    note = _build_note(
+        token_total,
+        baseline,
+        budget,
+        trimmed,
+        upgraded,
+        worth,
+        split_segments,
+        response_tokens=response_tokens,
+    )
+    if force:
+        note = f"forced: {note}"
 
     return Pack(
         target=target_slice,
@@ -1021,14 +1056,5 @@ def pack(
         token_baseline=baseline,
         savings_pct=tokens.savings_pct(token_total, baseline),
         worth_using=worth,
-        note=_build_note(
-            token_total,
-            baseline,
-            budget,
-            trimmed,
-            upgraded,
-            worth,
-            split_segments,
-            response_tokens=response_tokens,
-        ),
+        note=note,
     )
