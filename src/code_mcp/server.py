@@ -21,7 +21,7 @@ from .graph.tauri import build_bridges
 from .index.builder import build_index
 from .index.modules import resolve_imports
 from .index.search import search_comments, search_symbols
-from .pack import pack as build_pack
+from .pack import ensure_fresh, pack as build_pack
 from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
@@ -215,6 +215,10 @@ def slice_symbol(
         lines = source_path.read_bytes().decode("utf-8", errors="replace").splitlines()
 
         if name:
+            if not ensure_fresh(conn, root, file):
+                raise ValueError(
+                    "file changed on disk and could not be re-indexed; run index"
+                )
             symbol = find_symbol(conn, file, name)
             if symbol is None:
                 raise ValueError(f"symbol not found: {name} in {file}")

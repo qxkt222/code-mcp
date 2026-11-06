@@ -653,6 +653,73 @@ def _file_lang(conn: sqlite3.Connection, rel: str) -> str:
     return row["lang"] if row is not None else ""
 
 
+# --------------------------------------------------------------------------- #
+# Index freshness
+# --------------------------------------------------------------------------- #
+
+
+def ensure_fresh(conn: sqlite3.Connection, root: Path, rel: str) -> bool:
+    """Re-index ``rel`` when its mtime or size drifted from the index.
+
+    The index stores byte offsets, so a file edited outside ``edit`` shifts
+    every later symbol; slicing by those offsets would return a neighbour's
+    code. Returns True when the file is safe to slice by offset.
+    """
+    # Imported here rather than at module load: builder and graph do not import
+    # pack today, but keeping the dependency local keeps that cycle impossible.
+    from .graph.refs import resolve_refs
+    from .graph.tauri import build_bridges
+    from .index.builder import _load_sizes, reindex_file
+
+    rel = normalize_path(rel)
+    root = Path(root)
+    try:
+        stat = (root / rel).stat()
+    except OSError:
+        return False
+
+    row = conn.execute("SELECT mtime FROM files WHERE path = ?", (rel,)).fetchone()
+    if row is not None:
+        sizes = _load_sizes(conn)
+        if float(row["mtime"]) == stat.st_mtime and sizes.get(rel) == stat.st_size:
+            return True
+
+    if not reindex_file(root, conn, rel):
+        return False
+    # Replacing the file row cascaded its symbols away and nulled every ref
+    # that pointed at them, so rebuild the graph edges before returning.
+    resolve_refs(conn)
+    build_bridges(conn)
+    conn.commit()
+    return True
+
+
+# --------------------------------------------------------------------------- #
+# Relevance ordering
+# --------------------------------------------------------------------------- #
+
+
+def _relevance_key(item: Symbol | _Piece, target_file: str) -> tuple[int, int, str]:
+    """Distance from ``target_file``: same file, directory, package, rest.
+
+    Within one tier, earlier source lines come first. ``file`` only breaks ties
+    between different files that happen to share a line number.
+    """
+    file = item.file
+    if file == target_file:
+        tier = 0
+    else:
+        target_dir = target_file.rsplit("/", 1)[0] if "/" in target_file else ""
+        item_dir = file.rsplit("/", 1)[0] if "/" in file else ""
+        if item_dir == target_dir:
+            tier = 1
+        elif file.split("/", 1)[0] == target_file.split("/", 1)[0]:
+            tier = 2
+        else:
+            tier = 3
+    return tier, item.start_line, file
+
+
 def _line_byte_range(source: bytes, start_line: int, end_line: int) -> tuple[int, int]:
     """Byte offsets for an inclusive 1-based line range, for stale index rows."""
     lines = source.splitlines(keepends=True)
@@ -768,6 +835,14 @@ def pack(
     imports, and the counts land in ``note``.
     """
     rel = normalize_path(file)
+    # Offsets in the index are only meaningful while the file still matches
+    # what was parsed. A drifted file is re-indexed before anything is sliced.
+    if not ensure_fresh(conn, root, rel):
+        return Pack(
+            note="file changed on disk and could not be re-indexed; run index",
+            worth_using=False,
+        )
+
     target = find_symbol(conn, rel, name) if name else _default_target(conn, rel)
     if target is None:
         label = f"{rel}:{name}" if name else rel
@@ -808,13 +883,19 @@ def pack(
             return False
         return include_tests or not _is_test_match(symbol, target)
 
-    for symbol in callers(conn, target.id):
+    # Rank by distance from the target before any budget trimming: the least
+    # relevant neighbours are the ones dropped first.
+    for symbol in sorted(
+        callers(conn, target.id), key=lambda item: _relevance_key(item, rel)
+    ):
         if not usable(symbol):
             continue
         taken.add(symbol.id)
         sections["callers"].append(_signature_piece(symbol, reader))
 
-    for symbol in callees(conn, target.id):
+    for symbol in sorted(
+        callees(conn, target.id), key=lambda item: _relevance_key(item, rel)
+    ):
         if not usable(symbol):
             continue
         taken.add(symbol.id)

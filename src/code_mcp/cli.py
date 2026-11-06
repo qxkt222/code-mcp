@@ -15,7 +15,7 @@ from .index.builder import build_index
 from .index.modules import resolve_imports
 from .index.search import search_comments, search_symbols
 from .config import load_config
-from .pack import pack as build_pack
+from .pack import ensure_fresh, pack as build_pack
 from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
@@ -151,6 +151,12 @@ def cmd_slice(args: argparse.Namespace) -> int:
             return 1
         lines = source.read_bytes().decode("utf-8", errors="replace").splitlines()
         if args.name:
+            if not ensure_fresh(conn, root, args.file):
+                print(
+                    "file changed on disk and could not be re-indexed; run index",
+                    file=sys.stderr,
+                )
+                return 1
             symbol = find_symbol(conn, args.file, args.name)
             if symbol is None:
                 print(f"symbol not found: {args.name}", file=sys.stderr)

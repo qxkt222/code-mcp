@@ -12,12 +12,27 @@ from . import Collector, ParsedFile, collapse_ws, node_end_line, node_start_line
 
 _PARSER = Parser(Language(tree_sitter_python.language()))
 
+# Signatures are summaries: a long initializer is elided and the whole string
+# is capped. Short initializers stay so ``MAX_SIZE = 10`` still reads whole.
+_MAX_SIGNATURE = 200
+_SHORT_INITIALIZER = 80
+
+
+def _clip_signature(text: str) -> str:
+    """Collapse whitespace and cap the signature at 200 characters."""
+    text = collapse_ws(text)
+    if len(text) <= _MAX_SIGNATURE:
+        return text
+    return text[: _MAX_SIGNATURE - 3].rstrip() + "..."
+
 
 def parse_python(source: bytes) -> ParsedFile:
     """Parse Python source bytes into the index representation."""
     collector = Collector(source)
     tree = _PARSER.parse(source)
     _Walker(collector).walk(tree.root_node)
+    for symbol in collector.result.symbols:
+        symbol.signature = _clip_signature(symbol.signature)
     return collector.result
 
 
@@ -264,12 +279,25 @@ class _Walker:
             end_byte=node.end_byte,
             start_line=node_start_line(node),
             end_line=node_end_line(node),
-            signature=collapse_ws(self.c.node_text(node)),
+            signature=collapse_ws(self._assignment_signature(node)),
         )
         annotation = node.child_by_field_name("type")
         if annotation is not None:
             for type_name in self._type_names(annotation):
                 self.c.add_ref(self.qualname, type_name, REF_TYPE)
+
+    def _assignment_signature(self, node: Node) -> str:
+        """Assignment text up to the initializer.
+
+        A short initializer (< 80 chars collapsed) is kept whole; a long one is
+        elided so a module-level dict cannot leak into the indexed signature.
+        """
+        value = node.child_by_field_name("right")
+        end = node.end_byte
+        if value is not None:
+            keep = len(collapse_ws(self.c.node_text(value))) < _SHORT_INITIALIZER
+            end = node.end_byte if keep else value.start_byte
+        return self.c.snippet(node.start_byte, end).rstrip()
 
     def _call(self, node: Node) -> None:
         name = _expr_name(node.child_by_field_name("function"))

@@ -25,6 +25,19 @@ _ITEM_KINDS = {
     "static_item": "constant",
 }
 
+# Signatures are summaries: a long initializer is elided and the whole string
+# is capped. Short initializers stay so ``const MAX: u32 = 10`` reads whole.
+_MAX_SIGNATURE = 200
+_SHORT_INITIALIZER = 80
+
+
+def _clip_signature(text: str) -> str:
+    """Collapse whitespace and cap the signature at 200 characters."""
+    text = collapse_ws(text)
+    if len(text) <= _MAX_SIGNATURE:
+        return text
+    return text[: _MAX_SIGNATURE - 3].rstrip() + "..."
+
 
 def parse_rust(source: bytes) -> ParsedFile:
     """Parse Rust source bytes into the index representation."""
@@ -33,6 +46,8 @@ def parse_rust(source: bytes) -> ParsedFile:
     walker = _Walker(collector)
     walker.walk(tree.root_node)
     walker.finish()
+    for symbol in collector.result.symbols:
+        symbol.signature = _clip_signature(symbol.signature)
     return collector.result
 
 
@@ -277,6 +292,13 @@ class _Walker:
         body = node.child_by_field_name("body")
         if body is not None:
             end = body.start_byte
+        elif node.type in ("const_item", "static_item"):
+            # A const/static initializer can be a huge array or table; stop at
+            # its start unless it is short enough to read like a value.
+            value = node.child_by_field_name("value")
+            if value is not None:
+                keep = len(collapse_ws(self.c.node_text(value))) < _SHORT_INITIALIZER
+                end = value.end_byte if keep else value.start_byte
         raw = self.c.snippet(node.start_byte, end).rstrip()
         if raw.endswith(";"):
             raw = raw[:-1].rstrip()

@@ -354,6 +354,84 @@ def test_rust_use_list_expansion() -> None:
     assert {ref.to_name for ref in parsed.refs} == {"Read", "c", "d"}
 
 
+def test_typescript_long_initializers_are_elided() -> None:
+    body = "\n".join(f'  key{index}: "value {index}",' for index in range(30))
+    source = (
+        "export const BIG = {\n" + body + "\n};\n"
+        "export const SHORT = { a: 1 };\n"
+    ).encode()
+    symbols = _by_qual(parse_source(source, "typescript"))
+
+    # A long object literal never leaks into the signature.
+    assert symbols["BIG"].signature == "export const BIG ="
+    # Short initializers are kept so the constant still reads like a value.
+    assert symbols["SHORT"].signature == "export const SHORT = { a: 1 }"
+
+
+def test_python_long_initializer_is_elided() -> None:
+    body = "\n".join(f'    "key{index}": {index},' for index in range(40))
+    source = ("BIG = {\n" + body + "\n}\nSMALL = 5\n").encode()
+    symbols = _by_qual(parse_source(source, "python"))
+
+    assert symbols["BIG"].signature == "BIG ="
+    assert symbols["SMALL"].signature == "SMALL = 5"
+
+
+def test_rust_long_initializer_is_elided() -> None:
+    values = ", ".join(str(index) for index in range(60))
+    source = (
+        f"pub const BIG: &[u32] = &[{values}];\n"
+        "pub const SMALL: u32 = 10;\n"
+    ).encode()
+    symbols = _by_qual(parse_source(source, "rust"))
+
+    assert symbols["BIG"].signature == "pub const BIG: &[u32] ="
+    assert symbols["SMALL"].signature == "pub const SMALL: u32 = 10"
+
+
+def _wide_params(indent: str) -> str:
+    return ",\n".join(f"{indent}p{index}: SomeLongTypeName{index}" for index in range(20))
+
+
+def test_signatures_are_capped_across_languages() -> None:
+    sources = {
+        "typescript": (
+            "export function wide(\n" + _wide_params("  ") + "\n): void {}\n"
+        ).encode(),
+        "python": (
+            "def wide(\n" + _wide_params("    ") + "\n) -> None:\n    pass\n"
+        ).encode(),
+        "rust": (
+            "pub fn wide(\n" + _wide_params("    ") + "\n) {}\n"
+        ).encode(),
+    }
+    prefixes = {
+        "typescript": "export function wide(",
+        "python": "def wide(",
+        "rust": "pub fn wide(",
+    }
+    for language, source in sources.items():
+        symbol = _by_qual(parse_source(source, language))["wide"]
+        assert len(symbol.signature) <= 200, language
+        assert symbol.signature.endswith("..."), language
+        assert "\n" not in symbol.signature, language
+        assert symbol.signature.startswith(prefixes[language]), language
+
+
+def test_multiline_signatures_stay_whole_when_short() -> None:
+    source = b"def alpha(\n    first: int,\n    second: str,\n) -> None:\n    return None\n"
+    symbol = _by_qual(parse_source(source, "python"))["alpha"]
+    assert symbol.signature == "def alpha( first: int, second: str, ) -> None"
+
+
+def test_typescript_type_alias_signature_is_capped() -> None:
+    members = " ".join(f"field{index}: string;" for index in range(40))
+    source = f"export type Wide = {{ {members} }};\n".encode()
+    symbol = _by_qual(parse_source(source, "typescript"))["Wide"]
+    assert len(symbol.signature) <= 200
+    assert symbol.signature.endswith("...")
+
+
 def test_parse_file_reads_raw_bytes(tmp_path: Path) -> None:
     path = tmp_path / "sample.py"
     path.write_bytes("# 中文\n\ndef greet(name):\n    return name\n".encode("utf-8"))

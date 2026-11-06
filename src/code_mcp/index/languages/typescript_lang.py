@@ -30,6 +30,19 @@ _CLASS_VALUES = {"class", "class_expression"}
 # Anonymous function forms create a variable scope but no symbol of their own.
 _SCOPE_ONLY_VALUES = {"arrow_function", "function_expression", "generator_function"}
 
+# Signatures are summaries: a long initializer is elided and the whole string
+# is capped. Short initializers stay so ``const MAX = 10`` still reads whole.
+_MAX_SIGNATURE = 200
+_SHORT_INITIALIZER = 80
+
+
+def _clip_signature(text: str) -> str:
+    """Collapse whitespace and cap the signature at 200 characters."""
+    text = collapse_ws(text)
+    if len(text) <= _MAX_SIGNATURE:
+        return text
+    return text[: _MAX_SIGNATURE - 3].rstrip() + "..."
+
 
 def parse_typescript(source: bytes, lang: str = "typescript") -> ParsedFile:
     """Parse TypeScript/JavaScript/TSX source bytes into the index form."""
@@ -37,6 +50,8 @@ def parse_typescript(source: bytes, lang: str = "typescript") -> ParsedFile:
     parser = _TSX_PARSER if lang == "tsx" else _TS_PARSER
     tree = parser.parse(source)
     _Walker(collector).walk(tree.root_node)
+    for symbol in collector.result.symbols:
+        symbol.signature = _clip_signature(symbol.signature)
     return collector.result
 
 
@@ -359,7 +374,7 @@ class _Walker:
                 self._value_class(declarator, value, name, keyword, prefix)
             elif keyword == "const" and not self.scopes:
                 signature = f"{prefix}{keyword} " + collapse_ws(
-                    self.c.node_text(declarator).rstrip().rstrip(";")
+                    self._initializer_signature(declarator, value)
                 )
                 self.c.add_symbol(
                     name=name,
@@ -388,6 +403,18 @@ class _Walker:
                         self.containers.pop()
             else:
                 self._walk_children(declarator)
+
+    def _initializer_signature(self, declarator: Node, value: Node | None) -> str:
+        """Declarator text up to the initializer.
+
+        A short initializer (< 80 chars collapsed) is kept whole; a long one is
+        elided so an object literal cannot leak into the indexed signature.
+        """
+        end = declarator.end_byte
+        if value is not None:
+            keep = len(collapse_ws(self.c.node_text(value))) < _SHORT_INITIALIZER
+            end = value.end_byte if keep else value.start_byte
+        return self.c.snippet(declarator.start_byte, end).rstrip().rstrip(";").rstrip()
 
     def _value_function(
         self,

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
+from pathlib import Path
 
 from code_mcp import db, tokens
+from code_mcp.config import load_config
 from code_mcp.graph.refs import resolve_refs
-from code_mcp.pack import PACK_EXPAND_CAP_TOKENS, pack
+from code_mcp.index.builder import _SIZES_META_KEY, build_index
+from code_mcp.pack import PACK_EXPAND_CAP_TOKENS, ensure_fresh, pack
 from code_mcp.serialize import pack_dict
-from code_mcp.types import CONF_NAME, REF_CALL
+from code_mcp.types import CONF_EXACT, CONF_NAME, REF_CALL
 
 SERVICE = '''"""Service helpers."""
 from app.util import format_value, parse
@@ -99,6 +103,27 @@ def _ref(conn: sqlite3.Connection, from_id: int, to_name: str) -> None:
            VALUES (?, NULL, ?, ?, ?)""",
         (from_id, to_name, REF_CALL, CONF_NAME),
     )
+
+
+def _ref_to(conn: sqlite3.Connection, from_id: int, to_id: int, name: str) -> None:
+    """Insert an already-resolved edge, bypassing import-based resolution."""
+    conn.execute(
+        """INSERT INTO refs(from_symbol_id, to_symbol_id, to_name, kind, confidence)
+           VALUES (?, ?, ?, ?, ?)""",
+        (from_id, to_id, name, REF_CALL, CONF_EXACT),
+    )
+
+
+def _mark_fresh(conn: sqlite3.Connection, root: Path, *paths: str) -> None:
+    """Record real mtime/size so ``pack`` does not see the fixture as stale."""
+    sizes = json.loads(db.get_meta(conn, _SIZES_META_KEY) or "{}")
+    for path in paths:
+        stat = (root / path).stat()
+        conn.execute(
+            "UPDATE files SET mtime = ? WHERE path = ?", (stat.st_mtime, path)
+        )
+        sizes[path] = stat.st_size
+    db.set_meta(conn, _SIZES_META_KEY, json.dumps(sizes, sort_keys=True))
 
 
 def _line_offsets(text: str) -> list[int]:
@@ -195,6 +220,14 @@ def _fixture(tmp_path) -> tuple[sqlite3.Connection, dict[str, int]]:
             (tests, "app.service", "load", service),
         ],
     )
+    _mark_fresh(
+        conn,
+        tmp_path,
+        "app/service.py",
+        "app/util.py",
+        "app/view.py",
+        "tests/test_service.py",
+    )
     conn.commit()
 
     resolve_refs(conn)
@@ -267,6 +300,7 @@ def caller():
     )
     caller = _symbol(conn, file_id, "caller", 10, 11, "def caller()", "")
     _ref(conn, caller, "alpha")
+    _mark_fresh(conn, tmp_path, "mod.py")
     conn.commit()
     resolve_refs(conn)
 
@@ -495,6 +529,7 @@ def test_pack_normalises_crlf_line_endings(tmp_path):
     conn = _db(tmp_path)
     file_id = _file(conn, "mod.py", "def alpha():\n    return 1\n")
     _symbol(conn, file_id, "alpha", 1, 2, "def alpha():", "")
+    _mark_fresh(conn, tmp_path, "mod.py")
     conn.commit()
 
     packed = pack(conn, tmp_path, "mod.py", "alpha")
@@ -526,7 +561,9 @@ def _write(conn, root, path: str, text: str, lang: str = "python") -> int:
     target = root / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text, encoding="utf-8", newline="\n")
-    return _file(conn, path, text, lang)
+    file_id = _file(conn, path, text, lang)
+    _mark_fresh(conn, root, path)
+    return file_id
 
 
 def _big_fixture(tmp_path, statements: int = 1200, callers: int = 0):
@@ -745,3 +782,219 @@ def test_test_prefilter_keeps_multi_part_names(tmp_path):
         "test_fetch_user_data",
         "fetch_user_data_test",
     }
+
+
+# --------------------------------------------------------------------------- #
+# Index freshness (external edits)
+# --------------------------------------------------------------------------- #
+
+_PADDING_300 = "\n".join(f"# padding line {index}" for index in range(1, 301))
+
+
+def _built_index(tmp_path, path: str, source: str):
+    """Write ``source`` and index it through the real builder."""
+    target = tmp_path / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(source, encoding="utf-8", newline="\n")
+    conn = _db(tmp_path)
+    build_index(tmp_path, conn, load_config(tmp_path))
+    conn.commit()
+    return conn, target
+
+
+def test_pack_refreshes_a_file_changed_outside_the_index(tmp_path):
+    source = (
+        'def first():\n    return "first-original"\n\n\n'
+        'def second():\n    return "second-original"\n\n\n'
+        'def third():\n    return "third-original"\n\n\n'
+        + _PADDING_300
+        + "\n"
+    )
+    conn, target = _built_index(tmp_path, "svc.py", source)
+
+    before = pack(conn, tmp_path, "svc.py", "second")
+    assert before.target is not None
+    assert before.target.text == 'def second():\n    return "second-original"'
+
+    # An edit that never went through ``edit`` shifts every byte offset below
+    # it; the stale index would slice ``first`` instead of ``second``.
+    target.write_text(
+        '"""Service."""\n\n\n# inserted outside the index\n# another line\n\n\n'
+        + source,
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    after = pack(conn, tmp_path, "svc.py", "second")
+
+    assert after.target is not None
+    assert after.target.text == 'def second():\n    return "second-original"'
+    assert "first-original" not in after.target.text
+
+
+def test_pack_reports_a_symbol_deleted_outside_the_index(tmp_path):
+    source = (
+        "def first():\n    return 1\n\n\n"
+        "def second():\n    return 2\n\n\n"
+        + _PADDING_300
+        + "\n"
+    )
+    conn, target = _built_index(tmp_path, "svc.py", source)
+    assert pack(conn, tmp_path, "svc.py", "second").target is not None
+
+    target.write_text(
+        "def first():\n    return 1\n\n\n" + _PADDING_300 + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    packed = pack(conn, tmp_path, "svc.py", "second")
+
+    # The vanished symbol must be reported, never replaced by a neighbour.
+    assert packed.target is None
+    assert packed.worth_using is False
+    assert "target not found" in packed.note
+
+
+def test_pack_only_reindexes_after_real_drift(tmp_path, monkeypatch):
+    from code_mcp.index import builder
+
+    calls: list[str] = []
+    original = builder.reindex_file
+
+    def counting(root, conn, rel):
+        calls.append(rel)
+        return original(root, conn, rel)
+
+    monkeypatch.setattr(builder, "reindex_file", counting)
+    source = (
+        "def first():\n    return 1\n\n\n"
+        "def second():\n    return 2\n\n\n"
+        + _PADDING_300
+        + "\n"
+    )
+    conn, target = _built_index(tmp_path, "svc.py", source)
+
+    assert pack(conn, tmp_path, "svc.py", "second").target is not None
+    assert calls == []  # an unchanged file is never re-parsed
+
+    target.write_text(
+        "# shifted\n" + source, encoding="utf-8", newline="\n"
+    )
+    assert pack(conn, tmp_path, "svc.py", "second").target is not None
+    assert calls == ["svc.py"]
+
+    # The reindex updated mtime/size, so the next pack is stable again.
+    assert pack(conn, tmp_path, "svc.py", "second").target is not None
+    assert calls == ["svc.py"]
+
+
+def test_ensure_fresh_returns_false_when_the_file_is_gone(tmp_path):
+    source = "def alpha():\n    return 1\n\n" + _PADDING_300 + "\n"
+    (tmp_path / "mod.py").write_text(source, encoding="utf-8", newline="\n")
+    conn = _db(tmp_path)
+    build_index(tmp_path, conn, load_config(tmp_path))
+    conn.commit()
+
+    assert ensure_fresh(conn, tmp_path, "mod.py") is True
+    (tmp_path / "mod.py").unlink()
+
+    assert ensure_fresh(conn, tmp_path, "mod.py") is False
+
+
+# --------------------------------------------------------------------------- #
+# Relevance ordering
+# --------------------------------------------------------------------------- #
+
+
+def test_callers_and_callees_are_ranked_by_distance(tmp_path):
+    target_text = (
+        "def target():\n    return 1\n\n\n"
+        "def same_file_caller():\n    return target()\n\n\n"
+        "def same_file_callee():\n    return 2\n\n\n"
+        + _PADDING_300
+        + "\n"
+    )
+    dir_text = (
+        "def same_dir_caller_late():\n    return target()\n\n\n"
+        "def same_dir_caller_early():\n    return target()\n\n\n"
+        "def same_dir_callee():\n    return 2\n\n\n"
+        + _PADDING_300
+        + "\n"
+    )
+    pkg_text = (
+        "def same_pkg_caller():\n    return target()\n\n\n"
+        "def same_pkg_callee():\n    return 2\n\n\n"
+        + _PADDING_300
+        + "\n"
+    )
+    remote_text = (
+        "def remote_caller():\n    return target()\n\n\n"
+        "def remote_callee():\n    return 2\n\n\n"
+        + _PADDING_300
+        + "\n"
+    )
+
+    conn = _db(tmp_path)
+    files = {
+        "pkg/a.py": _write(conn, tmp_path, "pkg/a.py", target_text),
+        "pkg/b.py": _write(conn, tmp_path, "pkg/b.py", dir_text),
+        "pkg/sub/c.py": _write(conn, tmp_path, "pkg/sub/c.py", pkg_text),
+        "other/d.py": _write(conn, tmp_path, "other/d.py", remote_text),
+    }
+    texts = {
+        "pkg/a.py": target_text,
+        "pkg/b.py": dir_text,
+        "pkg/sub/c.py": pkg_text,
+        "other/d.py": remote_text,
+    }
+
+    def add(path: str, name: str, start: int) -> int:
+        return _symbol_span(
+            conn, files[path], texts[path], name, start, start + 1, f"def {name}()"
+        )
+
+    target_id = add("pkg/a.py", "target", 1)
+    callers = {
+        "same_file_caller": add("pkg/a.py", "same_file_caller", 5),
+        "same_dir_caller_late": add("pkg/b.py", "same_dir_caller_late", 1),
+        "same_dir_caller_early": add("pkg/b.py", "same_dir_caller_early", 5),
+        "same_pkg_caller": add("pkg/sub/c.py", "same_pkg_caller", 1),
+        "remote_caller": add("other/d.py", "remote_caller", 1),
+    }
+    callees = {
+        "same_file_callee": add("pkg/a.py", "same_file_callee", 9),
+        "same_dir_callee": add("pkg/b.py", "same_dir_callee", 9),
+        "same_pkg_callee": add("pkg/sub/c.py", "same_pkg_callee", 5),
+        "remote_callee": add("other/d.py", "remote_callee", 5),
+    }
+    for from_id in callers.values():
+        _ref_to(conn, from_id, target_id, "target")
+    for name, callee_id in callees.items():
+        _ref_to(conn, target_id, callee_id, name)
+    conn.commit()
+
+    packed = pack(
+        conn,
+        tmp_path,
+        "pkg/a.py",
+        "target",
+        budget_tokens=10**6,
+        include_tests=False,
+    )
+
+    # Same file > same directory > same top-level package > everywhere else;
+    # within one tier, earlier lines win.
+    assert [item.symbol for item in packed.callers] == [
+        "same_file_caller",
+        "same_dir_caller_late",
+        "same_dir_caller_early",
+        "same_pkg_caller",
+        "remote_caller",
+    ]
+    assert [item.symbol for item in packed.callees] == [
+        "same_file_callee",
+        "same_dir_callee",
+        "same_pkg_callee",
+        "remote_callee",
+    ]
