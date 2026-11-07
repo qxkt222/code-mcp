@@ -10,8 +10,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from .languages import (  # re-exported below for the documented contract
-    Collector,
     PARSERS,
+    Collector,
     ParsedFile,
     ParsedRef,
     ParsedSymbol,
@@ -35,8 +35,8 @@ _SUFFIXES: dict[str, str] = {
 }
 
 __all__ = [
-    "Collector",
     "PARSERS",
+    "Collector",
     "ParsedFile",
     "ParsedRef",
     "ParsedSymbol",

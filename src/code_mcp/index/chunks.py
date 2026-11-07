@@ -97,10 +97,10 @@ def segment_symbol(
     """
     try:
         return _segment_symbol(source, lang, start_byte, end_byte, max_tokens)
-    except Exception:  # noqa: BLE001 - the contract is "never raises"
+    except Exception:
         try:
             return _fallback(source, start_byte, end_byte)
-        except Exception:  # noqa: BLE001
+        except Exception:
             return []
 
 

@@ -9,6 +9,7 @@ cyclomatic-complexity dependency is used.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import math
 import re
 import sqlite3
@@ -16,7 +17,7 @@ import textwrap
 from pathlib import Path
 
 from ..paths import is_test_path
-from ..types import Finding, REF_CALL
+from ..types import REF_CALL, Finding
 
 # UI components legitimately run long, so the limit is per language. Only a
 # function more than twice the limit is treated as P1.
@@ -296,7 +297,7 @@ def _no_tests(conn: sqlite3.Connection, symbols: list[sqlite3.Row]) -> list[Find
 
 
 def _label(symbol: sqlite3.Row) -> str:
-    return symbol["qualname"] or symbol["name"]
+    return str(symbol["qualname"] or symbol["name"])
 
 
 def _symbol_text(
@@ -342,7 +343,7 @@ def _indent_unit(lines: list[str]) -> int:
     if len(widths) < 2:
         return 4
     unit = 0
-    for left, right in zip(widths, widths[1:]):
+    for left, right in itertools.pairwise(widths):
         unit = math.gcd(unit, right - left)
     if unit <= 0:
         return 4

@@ -30,6 +30,13 @@ _MINIFIED_SIZE_THRESHOLD = 200_000
 _MINIFIED_AVG_LINE = 800
 
 
+def _lastrowid(cursor: sqlite3.Cursor) -> int:
+    """INSERT 之后的 rowid 必然存在；把 ``int | None`` 收窄成 ``int``。"""
+    rowid = cursor.lastrowid
+    assert rowid is not None, "INSERT 之后 cursor.lastrowid 不应为 None"
+    return rowid
+
+
 @dataclass
 class IndexStats:
     files_indexed: int = 0
@@ -321,7 +328,7 @@ def _replace_file(
             parsed.loc,
         ),
     )
-    file_id = int(cursor.lastrowid)
+    file_id = _lastrowid(cursor)
 
     symbol_ids: dict[str, int] = {}
     for symbol in parsed.symbols:
@@ -343,7 +350,7 @@ def _replace_file(
                 symbol.docstring,
             ),
         )
-        symbol_ids.setdefault(symbol.qualname, int(cursor.lastrowid))
+        symbol_ids.setdefault(symbol.qualname, _lastrowid(cursor))
 
     module_id: int | None = None
     for ref in parsed.refs:
@@ -393,4 +400,4 @@ def _insert_module_symbol(
         ") VALUES (?, ?, '', 'module', ?, ?, ?, ?, ?, '')",
         (file_id, name, line, line, byte_length, byte_length, rel),
     )
-    return int(cursor.lastrowid)
+    return _lastrowid(cursor)

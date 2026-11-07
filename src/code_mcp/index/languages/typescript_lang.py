@@ -369,8 +369,18 @@ class _Walker:
             value_kind = value.type if value is not None else ""
 
             if value_kind in _FUNCTION_VALUES:
-                self._value_function(node, declarator, value, name, keyword, prefix, doc if index == 0 else "")
+                assert value is not None
+                self._value_function(
+                    node,
+                    declarator,
+                    value,
+                    name,
+                    keyword,
+                    prefix,
+                    (doc or "") if index == 0 else "",
+                )
             elif value_kind in _CLASS_VALUES:
+                assert value is not None
                 self._value_class(declarator, value, name, keyword, prefix)
             elif keyword == "const" and not self.scopes:
                 signature = f"{prefix}{keyword} " + collapse_ws(

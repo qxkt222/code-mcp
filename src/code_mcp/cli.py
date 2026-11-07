@@ -6,23 +6,25 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any, cast
 
+from . import tokens as token_util
+from .config import load_config
 from .db import open_index
+from .edit import replace_symbol
 from .graph.impact import impact as compute_impact
 from .graph.refs import find_symbol, resolve_refs
 from .graph.tauri import build_bridges
 from .index.builder import build_index
 from .index.modules import resolve_imports
 from .index.search import search_comments, search_symbols
-from .config import load_config
-from .pack import ensure_fresh, pack as build_pack
+from .pack import ensure_fresh
+from .pack import pack as build_pack
 from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
 from .review.structural import analyze as analyze_structure
 from .serialize import pack_dict, with_response_tokens
-from .edit import replace_symbol
-from . import tokens as token_util
 
 
 def _open(path: str):
@@ -312,15 +314,16 @@ def _gate_payload(result, detected: bool) -> dict:
     ``serialize.gate_dict`` is the single source of truth when present; the
     inline branch keeps the CLI working on its own.
     """
+    gate_dict: Any
     try:
         from .serialize import gate_dict
     except ImportError:  # pragma: no cover - an older serialize without it
         gate_dict = None
     if gate_dict is not None:
         try:
-            return gate_dict(result, detected_config=detected)
+            return cast("dict[Any, Any]", gate_dict(result, detected_config=detected))
         except TypeError:  # older signature without the optional argument
-            return gate_dict(result)
+            return cast("dict[Any, Any]", gate_dict(result))
     return {  # pragma: no cover - replaced by serialize.gate_dict
         "passed": result.passed,
         "detected_config": detected,

@@ -63,7 +63,7 @@ enum Color { Red, Green }
 const LOCAL_MAX = 3;
 '''.encode()
 
-RUST_SOURCE = '''//! module docs
+RUST_SOURCE = b'''//! module docs
 use std::collections::HashMap;
 use crate::foo::{Bar as Baz, self};
 
@@ -100,7 +100,7 @@ mod inner {
 }
 
 pub type Alias<T> = Vec<T>;
-'''.encode()
+'''
 
 
 def _by_qual(parsed):
@@ -434,7 +434,7 @@ def test_typescript_type_alias_signature_is_capped() -> None:
 
 def test_parse_file_reads_raw_bytes(tmp_path: Path) -> None:
     path = tmp_path / "sample.py"
-    path.write_bytes("# 中文\n\ndef greet(name):\n    return name\n".encode("utf-8"))
+    path.write_bytes("# 中文\n\ndef greet(name):\n    return name\n".encode())
     parsed = parse_file(path, "sample.py", "python")
     assert [symbol.name for symbol in parsed.symbols] == ["greet"]
     symbol = parsed.symbols[0]

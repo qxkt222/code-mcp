@@ -175,7 +175,7 @@ class ReviewReport:
     score: float = 0.0
 
     def by_severity(self) -> dict[str, int]:
-        counts = {level: 0 for level in SEVERITY_ORDER}
+        counts = dict.fromkeys(SEVERITY_ORDER, 0)
         for finding in self.findings:
             counts[finding.severity] = counts.get(finding.severity, 0) + 1
         return counts

@@ -21,7 +21,8 @@ from .graph.tauri import build_bridges
 from .index.builder import build_index
 from .index.modules import resolve_imports
 from .index.search import search_comments, search_symbols
-from .pack import ensure_fresh, pack as build_pack
+from .pack import ensure_fresh
+from .pack import pack as build_pack
 from .paths import resolve_within
 from .review.external import detect_tools, run_external
 from .review.gate import run_gate
@@ -384,7 +385,7 @@ def review(path: str, min_severity: str = "P2", paths: list[str] | None = None) 
         kept = [item for item in findings if order.index(item.severity) <= cutoff]
         kept.sort(key=lambda item: (order.index(item.severity), item.file, item.line))
 
-        counts = {level: 0 for level in order}
+        counts = dict.fromkeys(order, 0)
         for item in kept:
             counts[item.severity] += 1
 

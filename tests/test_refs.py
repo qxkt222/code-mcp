@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
-from pathlib import Path
 
 from code_mcp import db
-from code_mcp.graph.refs import callers, callees, find_symbol, resolve_refs
+from code_mcp.graph.refs import callees, callers, find_symbol, resolve_refs
 from code_mcp.types import (
     CONF_BRIDGE,
     CONF_EXACT,

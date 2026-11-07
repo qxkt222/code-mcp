@@ -197,8 +197,8 @@ PARSERS = {
 }
 
 __all__ = [
-    "Collector",
     "PARSERS",
+    "Collector",
     "ParsedFile",
     "ParsedRef",
     "ParsedSymbol",

@@ -24,6 +24,7 @@ import hashlib
 import re
 import sqlite3
 from pathlib import Path
+from typing import cast
 
 import tree_sitter_python
 import tree_sitter_rust
@@ -258,14 +259,20 @@ def _relative_path(root: Path, file: str) -> str | None:
 
 
 def _lookup_symbol(conn: sqlite3.Connection, rel: str, name: str) -> sqlite3.Row | None:
-    return conn.execute(_SYMBOL_SQL, (rel, name, name, name, name)).fetchone()
+    return cast(
+        "sqlite3.Row | None",
+        conn.execute(_SYMBOL_SQL, (rel, name, name, name, name)).fetchone(),
+    )
 
 
 def _lookup_file(conn: sqlite3.Connection, rel: str) -> sqlite3.Row | None:
-    return conn.execute(
-        "SELECT f.hash AS file_hash, f.lang AS lang FROM files f WHERE f.path = ?",
-        (rel,),
-    ).fetchone()
+    return cast(
+        "sqlite3.Row | None",
+        conn.execute(
+            "SELECT f.hash AS file_hash, f.lang AS lang FROM files f WHERE f.path = ?",
+            (rel,),
+        ).fetchone(),
+    )
 
 
 def _import_is_indexed(conn: sqlite3.Connection, rel: str, name: str) -> bool:
@@ -529,5 +536,5 @@ def _build_diff(old_text: str, new_text: str, rel: str) -> tuple[int, int, str]:
     added = sum(1 for line in lines if line.startswith("+") and not line.startswith("+++"))
     removed = sum(1 for line in lines if line.startswith("-") and not line.startswith("---"))
     if len(lines) > MAX_DIFF_LINES:
-        lines = lines[: MAX_DIFF_LINES - 1] + ["... (diff truncated)"]
+        lines = [*lines[: MAX_DIFF_LINES - 1], "... (diff truncated)"]
     return added, removed, "\n".join(lines)

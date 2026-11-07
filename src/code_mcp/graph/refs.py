@@ -155,7 +155,7 @@ def _resolve_target(
         # Several same-file definitions with this name: never guess.
         return None
 
-    targets = imported.get(from_file, frozenset())
+    targets = imported.get(from_file, set())
     cross_file = [
         symbol_id for symbol_id, file_id in candidates if file_id in targets
     ]
@@ -185,8 +185,11 @@ def resolve_refs(conn: sqlite3.Connection) -> int:
         row["path"]: (int(row["id"]), row["lang"] or "")
         for row in conn.execute("SELECT id, path, lang FROM files")
     }
-    by_id = {file_id: path for path, (file_id, _lang) in files.items()}
-    lang_by_file = {file_id: lang for file_id, lang in files.values()}
+    by_id: dict[int, str] = {}
+    lang_by_file: dict[int, str] = {}
+    for path, (file_id, lang) in files.items():
+        by_id[file_id] = path
+        lang_by_file[file_id] = lang
 
     by_name: dict[str, list[tuple[int, int]]] = {}
     by_qualname: dict[str, list[tuple[int, int]]] = {}

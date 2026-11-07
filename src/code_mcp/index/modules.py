@@ -252,8 +252,12 @@ def _load_ts_config(root: Path) -> _TsConfig | None:
             options = {}
 
         base = options.get("baseUrl")
-        base_declared = isinstance(base, str) and bool(base.strip())
-        base_url = _normalize(_posix_join("", base)) if base_declared else ""
+        if isinstance(base, str) and base.strip():
+            base_declared = True
+            base_url = _normalize(_posix_join("", base))
+        else:
+            base_declared = False
+            base_url = ""
 
         entries: list[tuple[str, tuple[str, ...]]] = []
         raw_paths = options.get("paths")
@@ -276,11 +280,13 @@ def _read_json(path: Path) -> object | None:
     except OSError:
         return None
     try:
-        return json.loads(raw)
+        parsed: object = json.loads(raw)
+        return parsed
     except ValueError:
         pass
     try:
-        return json.loads(_strip_jsonc(raw))
+        parsed = json.loads(_strip_jsonc(raw))
+        return parsed
     except ValueError:
         return None
 

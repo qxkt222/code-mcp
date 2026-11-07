@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .impact import ImpactNode, impact
-from .refs import callers, callees, find_symbol, resolve_refs
+from .refs import callees, callers, find_symbol, resolve_refs
 from .tauri import build_bridges, find_bridge_targets
 
 __all__ = [

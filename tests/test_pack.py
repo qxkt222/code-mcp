@@ -242,11 +242,17 @@ def _fixture(tmp_path) -> tuple[sqlite3.Connection, dict[str, int]]:
 
 
 def _slices(packed):
-    return [packed.target] + packed.callers + packed.callees + packed.imports + packed.tests
+    return [
+        packed.target,
+        *packed.callers,
+        *packed.callees,
+        *packed.imports,
+        *packed.tests,
+    ]
 
 
 def test_pack_includes_every_section(tmp_path):
-    conn, ids = _fixture(tmp_path)
+    conn, _ = _fixture(tmp_path)
     packed = pack(conn, tmp_path, "app/service.py", "load", budget_tokens=10**6)
 
     assert packed.target is not None
@@ -699,7 +705,7 @@ def test_neighbour_expansion_has_an_absolute_cap(tmp_path):
     conn = _db(tmp_path)
     file_id = _write(conn, tmp_path, "cap.py", source)
     lines = source.splitlines()
-    target_id = _symbol_span(conn, file_id, source, "target", 1, 2, "def target()")
+    _symbol_span(conn, file_id, source, "target", 1, 2, "def target()")
     for index in range(3):
         start = next(
             line_no
@@ -732,7 +738,7 @@ def test_import_without_a_matching_symbol_stays_a_header(tmp_path):
     conn = _db(tmp_path)
     helpers_id = _write(conn, tmp_path, "app/helpers.py", helpers)
     service_id = _write(conn, tmp_path, "app/service.py", service)
-    run_id = _symbol_span(
+    _symbol_span(
         conn, service_id, service, "run", 4, 5, "def run()", kind="function"
     )
     conn.execute(
