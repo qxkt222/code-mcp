@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Python 依赖：直接改 pyproject 约束、刷新 uv.lock，开 PR 等周末合并。
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "20:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  # CI 本身也会过期：setup-uv 的 major 版本、actions/checkout 都得跟。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "20:00"
+      timezone: "Asia/Shanghai"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"

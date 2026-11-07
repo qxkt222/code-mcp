@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    # 每天 UTC 20:00 = 北京时间次日 04:00。
+    # 代码没变也跑，为的是抓上游依赖/环境漂移——push CI 永远抓不到这类问题。
+    - cron: "0 20 * * *"
   workflow_dispatch:
 
 permissions:
