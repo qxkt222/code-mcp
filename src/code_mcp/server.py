@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-
-from mcp.server.mcpserver import MCPServer
+from typing import TYPE_CHECKING
 
 from . import tokens as token_util
 from .config import load_config
@@ -24,19 +23,19 @@ from .index.search import search_comments, search_symbols
 from .pack import ensure_fresh
 from .pack import pack as build_pack
 from .paths import resolve_within
-from .review.external import detect_tools, run_external
+from .review import collect
 from .review.gate import run_gate
-from .review.structural import analyze as analyze_structure
-from .serialize import pack_dict, with_response_tokens
-from .types import Symbol
+from .serialize import gate_dict, pack_dict, with_response_tokens
+from .types import SEVERITY_ORDER, Symbol
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from mcp.server.mcpserver import MCPServer
 
 INSTRUCTIONS = (
     "Local code-context server. Use it before reading whole files: it returns only the "
     "symbol you asked for plus the code causally connected to it, and reports how many "
     "tokens that saved versus reading the file. Run `index` once per repository first."
 )
-
-mcp = MCPServer("code-mcp", instructions=INSTRUCTIONS)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -373,19 +372,9 @@ def review(path: str, min_severity: str = "P2", paths: list[str] | None = None) 
     root = _root(path)
     conn = _conn(root)
     try:
-        order = ["P0", "P1", "P2", "P3"]
-        cutoff = order.index(min_severity) if min_severity in order else len(order)
+        kept, ran, missing = collect(root, conn, min_severity, paths)
 
-        findings = analyze_structure(conn, files=paths)
-
-        tools = detect_tools(root)
-        external_findings, ran, missing = run_external(root, tools, paths=paths)
-        findings.extend(external_findings)
-
-        kept = [item for item in findings if order.index(item.severity) <= cutoff]
-        kept.sort(key=lambda item: (order.index(item.severity), item.file, item.line))
-
-        counts = dict.fromkeys(order, 0)
+        counts = dict.fromkeys(SEVERITY_ORDER, 0)
         for item in kept:
             counts[item.severity] += 1
 
@@ -429,26 +418,10 @@ def gate(path: str, only: list[str] | None = None, timeout_s: int = 600) -> dict
             step.timeout = min(step.timeout, timeout_s)
 
     result = run_gate(config, only=only)
-    return with_response_tokens(
-        {
-            "passed": result.passed,
-            "detected_config": config.detected,
-            "steps": [
-                {
-                    "name": step.name,
-                    "command": step.command,
-                    "passed": step.passed,
-                    "exit_code": step.exit_code,
-                    "duration_s": round(step.duration_s, 2),
-                    "output": step.output,
-                }
-                for step in result.steps
-            ],
-        }
-    )
+    return with_response_tokens(gate_dict(result, detected_config=config.detected))
 
 
-def _register() -> None:
+def _register(mcp: MCPServer) -> None:
     mcp.tool()(index)
     mcp.tool()(find)
     mcp.tool()(pack)
@@ -459,12 +432,25 @@ def _register() -> None:
     mcp.tool()(gate)
 
 
-_register()
+def build_server() -> MCPServer:
+    """Create the MCP server with every tool registered.
+
+    ``mcp`` is imported here rather than at module scope: the SDK's package
+    ``__init__`` eagerly pulls in its client stack, which costs about 0.9s and
+    is not needed until the server actually starts. Deferring it keeps
+    ``import code_mcp.server`` cheap for the CLI and for tool functions used
+    directly (tests, ``code_mcp.cli``).
+    """
+    from mcp.server.mcpserver import MCPServer
+
+    server = MCPServer("code-mcp", instructions=INSTRUCTIONS)
+    _register(server)
+    return server
 
 
 def main() -> None:
     """Run the MCP server over stdio."""
-    mcp.run()
+    build_server().run()
 
 
 if __name__ == "__main__":

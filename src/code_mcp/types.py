@@ -31,25 +31,12 @@ REF_CALL = "call"
 REF_IMPORT = "import"
 REF_INHERIT = "inherit"
 REF_TYPE = "type_ref"
-REF_NAME = "name_match"
 
 CONF_EXACT = "exact"
 CONF_NAME = "name_match"
 CONF_BRIDGE = "bridge"
 
 SEVERITY_ORDER: tuple[str, ...] = ("P0", "P1", "P2", "P3")
-
-
-@dataclass(slots=True)
-class FileRecord:
-    """One indexed source file. ``path`` is repo-relative and forward-slashed."""
-
-    id: int = 0
-    path: str = ""
-    lang: str = ""
-    mtime: float = 0.0
-    hash: str = ""
-    loc: int = 0
 
 
 @dataclass(slots=True)
@@ -68,17 +55,6 @@ class Symbol:
     end_byte: int = 0
     signature: str = ""
     docstring: str = ""
-
-
-@dataclass(slots=True)
-class Ref:
-    """A directed edge between two symbols, or from a symbol to an unresolved name."""
-
-    from_symbol_id: int = 0
-    to_symbol_id: int | None = None
-    to_name: str = ""
-    kind: str = REF_CALL
-    confidence: str = CONF_NAME
 
 
 @dataclass(slots=True)
@@ -165,20 +141,6 @@ class Finding:
     line: int
     message: str
     symbol: str = ""
-
-
-@dataclass(slots=True)
-class ReviewReport:
-    findings: list[Finding] = field(default_factory=list)
-    external_ran: list[str] = field(default_factory=list)
-    external_missing: list[str] = field(default_factory=list)
-    score: float = 0.0
-
-    def by_severity(self) -> dict[str, int]:
-        counts = dict.fromkeys(SEVERITY_ORDER, 0)
-        for finding in self.findings:
-            counts[finding.severity] = counts.get(finding.severity, 0) + 1
-        return counts
 
 
 @dataclass(slots=True)

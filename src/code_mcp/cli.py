@@ -6,7 +6,6 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, cast
 
 from . import tokens as token_util
 from .config import load_config
@@ -21,10 +20,9 @@ from .index.search import search_comments, search_symbols
 from .pack import ensure_fresh
 from .pack import pack as build_pack
 from .paths import resolve_within
-from .review.external import detect_tools, run_external
+from .review import collect
 from .review.gate import run_gate
-from .review.structural import analyze as analyze_structure
-from .serialize import pack_dict, with_response_tokens
+from .serialize import gate_dict, pack_dict, with_response_tokens
 
 
 def _open(path: str):
@@ -273,14 +271,7 @@ def cmd_impact(args: argparse.Namespace) -> int:
 def cmd_review(args: argparse.Namespace) -> int:
     root, conn = _open(args.path)
     try:
-        order = ["P0", "P1", "P2", "P3"]
-        cutoff = order.index(args.min_severity) if args.min_severity in order else len(order)
-        findings = analyze_structure(conn, files=args.files)
-        tools = detect_tools(root)
-        external, ran, missing = run_external(root, tools, paths=args.files)
-        findings.extend(external)
-        kept = [item for item in findings if order.index(item.severity) <= cutoff]
-        kept.sort(key=lambda item: (order.index(item.severity), item.file, item.line))
+        kept, ran, missing = collect(root, conn, args.min_severity, args.files)
 
         if args.json:
             _print_json(
@@ -309,36 +300,8 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def _gate_payload(result, detected: bool) -> dict:
-    """JSON-ready gate result, shared with ``server.gate``.
-
-    ``serialize.gate_dict`` is the single source of truth when present; the
-    inline branch keeps the CLI working on its own.
-    """
-    gate_dict: Any
-    try:
-        from .serialize import gate_dict
-    except ImportError:  # pragma: no cover - an older serialize without it
-        gate_dict = None
-    if gate_dict is not None:
-        try:
-            return cast("dict[Any, Any]", gate_dict(result, detected_config=detected))
-        except TypeError:  # older signature without the optional argument
-            return cast("dict[Any, Any]", gate_dict(result))
-    return {  # pragma: no cover - replaced by serialize.gate_dict
-        "passed": result.passed,
-        "detected_config": detected,
-        "steps": [
-            {
-                "name": step.name,
-                "command": step.command,
-                "passed": step.passed,
-                "exit_code": step.exit_code,
-                "duration_s": round(step.duration_s, 2),
-                "output": step.output,
-            }
-            for step in result.steps
-        ],
-    }
+    """JSON-ready gate result, shared with ``server.gate``."""
+    return gate_dict(result, detected_config=detected)
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
